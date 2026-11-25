@@ -15,7 +15,7 @@ The demo runs a host and a guest over an in-memory pipe, including a disconnect 
 
 ## LAN quick start
 
-Build the CLI with Go 1.26 or newer. The first build downloads modules:
+Build the CLI. It needs Go 1.26; an older Go downloads it automatically on the first build, along with the modules:
 
 ```sh
 cd lan
@@ -29,7 +29,7 @@ Run each player in their own terminal or on their own machine. The binary is sel
 # Alice: host a room and leave it running. It prints an `Invite:` token.
 ./bin/you-be-the-ball host -players 2
 
-# Bob: optionally list open public rooms on the LAN, then join with the token.
+# Bob: optionally look for open rooms, then join with the token.
 ./bin/you-be-the-ball find
 ./bin/you-be-the-ball join 'TOKEN'
 ```
@@ -41,7 +41,7 @@ Then type these commands into the running processes, in order:
 | Alice | `status`, then `start` | `online=2/2`, then `Started`. Only the host can start. |
 | Bob | `inc bob-1`, then `offline` | `committed bob-1 at v2`. Bob stops syncing. |
 | Alice | `inc alice-1` | `committed alice-1 at v3`. |
-| Bob | `online`, then `inc bob-1` | Reconnected. The retry returns the original `v2` receipt. |
+| Bob | `online`, then `inc bob-1` | No output, then `committed bob-1 at v2` again: the retry returns the original receipt. |
 | Both | `status` | `version=3 counter=2` on both. `quit` exits. |
 
 - **One machine:** pass `-listen /ip4/127.0.0.1/tcp/42042 -mdns=false` to `host`.
@@ -51,7 +51,7 @@ Then type these commands into the running processes, in order:
 
 ## Where game data is stored
 
-Everything the CLI writes goes under `.you-be-the-ball` in your home directory (`%USERPROFILE%\.you-be-the-ball` on Windows). Nothing is written to the project or to the directory you launch from.
+By default, everything the CLI writes goes under `.you-be-the-ball` in your home directory (`%USERPROFILE%\.you-be-the-ball` on Windows), not in the project or the directory you launch from.
 
 ```text
 ~/.you-be-the-ball/
@@ -66,7 +66,7 @@ Everything the CLI writes goes under `.you-be-the-ball` in your home directory (
 - **The game record lives only on the host.** Guests keep their copy in memory and rebuild it from the host when they rejoin.
 - **Keep a profile to keep your place.** The host's folder resumes its room, and saved room settings win over creation flags. A guest's `identity.key` reclaims its seat once the game has started. Delete a profile folder to start fresh.
 - **Keep it private.** The folder holds private keys and can hold a room's invite secret. To read the event log without the secret, run `jq '.Events' ~/.you-be-the-ball/host/room.json`.
-- **Expiry:** a room lasts 72 hours from creation, or less with `host -ttl 10m`. Reconnecting does not extend it. An expired room refuses all operations and its `room.json` is deleted; `identity.key` is kept.
+- **Expiry:** a room lasts 72 hours from creation, or less with `host -ttl 10m`. Reconnecting does not extend it. An expired room refuses all operations and its `room.json` is deleted; `identity.key` is kept. Running `host` again starts a new room with a new invite.
 
 To change the defaults, create `~/.you-be-the-ball/config.json` with only the fields you need:
 
@@ -76,14 +76,14 @@ To change the defaults, create `~/.you-be-the-ball/config.json` with only the fi
 
 `peer_listen` and `mdns` are also supported. Flags override the config file.
 
-`-dir PATH` stores a profile somewhere else; a relative path is resolved against the launch directory. Builds from before the home-directory layout wrote `.p2p-NAME` folders into the launch directory. `migrate PATH/.p2p-NAME` moves one to `~/.you-be-the-ball/NAME`; stop the old process first. It never overwrites an existing profile.
+`-dir PATH` uses that folder instead of a profile. To keep a `.p2p-NAME` folder from an older build, stop that process and run `migrate PATH/.p2p-NAME` before you first use profile `NAME`. It moves the folder (same filesystem only) to `~/.you-be-the-ball/NAME` and never overwrites an existing profile.
 
 ## Packages
 
 | Package | Responsibility |
 | --- | --- |
 | `room` | Admission and start, fixed roster after start, private invites, event ordering, retry receipts, atomic host storage, expiry. |
-| `session` | Versioned request/response stream, bounded frames, paged replay, guest replica. Browsing never takes a seat. |
+| `session` | Versioned request/response stream, bounded frames, paged replay, guest replica. Browsing never takes a seat. The transport must supply authenticated peer IDs. |
 | `lan` | libp2p identities and streams, invites, mDNS discovery. `lan/cmd/you-be-the-ball` is the CLI. |
 | `example/counter` | The three game hooks: `Initial`, `Decide` and deterministic `Apply`. Replace these to plug in another game. |
 
@@ -92,7 +92,7 @@ To change the defaults, create `~/.you-be-the-ball/config.json` with only the fi
 ## Guarantees and limits
 
 - **Retries:** use a fresh command ID for each action, and retry the same action with the same ID. IDs are scoped to the player and room.
-- **Consistency:** every replica has the same state at the same event version. Guests can lag; the CLI polls every half second, and a broken connection can take up to 20 seconds to notice. This is not frame-by-frame action networking.
+- **Consistency:** every replica has the same state at the same event version. Guests can lag; the CLI polls every half second, and the host can take up to 20 seconds to notice a dropped guest. This is not frame-by-frame action networking.
 - **Limits:** 2–32 players, 4 KiB per game payload, 4,096 events per room including the start. There is no host migration, internet lobby, NAT traversal, relay or anti-cheat.
 
 `DESIGN.md` describes the intended next stage.
