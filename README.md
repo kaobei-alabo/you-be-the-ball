@@ -4,7 +4,7 @@ A Go prototype for small, player-hosted game rooms on a LAN. One player hosts th
 
 ## Offline demo
 
-From the project root, with Go 1.24 or newer:
+From the project root. The project needs Go 1.26; an older Go downloads it automatically, along with the modules, on first use:
 
 ```sh
 go run ./cmd/demo
@@ -15,12 +15,10 @@ The demo runs a host and a guest over an in-memory pipe, including a disconnect 
 
 ## LAN quick start
 
-Build the CLI. It needs Go 1.26; an older Go downloads it automatically on the first build, along with the modules:
+Build the CLI:
 
 ```sh
-cd lan
-go build -o ../bin/you-be-the-ball ./cmd/you-be-the-ball
-cd ..
+go build -o bin/you-be-the-ball ./cmd/you-be-the-ball
 ```
 
 Run each player in their own terminal or on their own machine. The binary is self-contained, so you can copy it to another machine with the same OS and architecture.
@@ -82,12 +80,14 @@ To change the defaults, create `~/.you-be-the-ball/config.json` with only the fi
 
 | Package | Responsibility |
 | --- | --- |
+| `game` | The `Game` interface: `Initial`, `Decide` and deterministic `Apply`. `game/counter` is the test game; replace it to plug in another. |
 | `room` | Admission and start, fixed roster after start, private invites, event ordering, retry receipts, atomic host storage, expiry. |
 | `session` | Versioned request/response stream, bounded frames, paged replay, guest replica. Browsing never takes a seat. The transport must supply authenticated peer IDs. |
-| `lan` | libp2p identities and streams, invites, mDNS discovery. `lan/cmd/you-be-the-ball` is the CLI. |
-| `example/counter` | The three game hooks: `Initial`, `Decide` and deterministic `Apply`. Replace these to plug in another game. |
+| `lan` | libp2p identities and streams, invites, mDNS discovery. |
+| `internal/home` | Profiles and `config.json` under `~/.you-be-the-ball`. |
+| `cmd/you-be-the-ball` | The CLI. `cmd/demo` is the offline demo. |
 
-`lan` is a separate module so the core and its offline tests stay free of networking dependencies.
+`game`, `room` and `session` use only the standard library.
 
 ## Guarantees and limits
 

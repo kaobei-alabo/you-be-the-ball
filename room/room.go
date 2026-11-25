@@ -14,6 +14,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/kaobei-alabo/you-be-the-ball/game"
 )
 
 const (
@@ -24,13 +26,6 @@ const (
 )
 
 var ErrExpired = errors.New("room expired")
-
-// Game callbacks must be deterministic (Apply), quick, and must not re-enter the room.
-type Game interface {
-	Initial() []byte
-	Decide(state []byte, actor string, command []byte) ([]byte, error)
-	Apply(state []byte, event []byte) ([]byte, error)
-}
 
 type Config struct {
 	Host    string
@@ -75,7 +70,7 @@ type Room struct {
 	r        record
 	file     string
 	now      func() time.Time
-	game     Game
+	game     game.Game
 	state    []byte
 	online   map[string]uint64
 	next     uint64
@@ -96,17 +91,17 @@ func Token() string { var b [16]byte; _, _ = rand.Read(b[:]); return hex.EncodeT
 
 // Open resumes an unexpired room, or creates one if absent/expired. Use one owner per
 // directory. Passing an empty directory selects volatile storage (for demos/tests).
-func Open(dir string, c Config, game Game) (*Room, error) {
+func Open(dir string, c Config, g game.Game) (*Room, error) {
 	if c.Now == nil {
 		c.Now = time.Now
 	}
 	if c.TTL == 0 {
 		c.TTL = MaxTTL
 	}
-	if c.Host == "" || len(c.Host) > 256 || c.Players < 2 || c.Players > 32 || c.TTL <= 0 || c.TTL > MaxTTL || game == nil {
+	if c.Host == "" || len(c.Host) > 256 || c.Players < 2 || c.Players > 32 || c.TTL <= 0 || c.TTL > MaxTTL || g == nil {
 		return nil, errors.New("require a host, game, 2..32 players, and TTL in (0,72h]")
 	}
-	r := &Room{now: c.Now, game: game, state: bytes.Clone(game.Initial()), online: map[string]uint64{c.Host: 1}, next: 1, receipts: make(map[receipt]int)}
+	r := &Room{now: c.Now, game: g, state: bytes.Clone(g.Initial()), online: map[string]uint64{c.Host: 1}, next: 1, receipts: make(map[receipt]int)}
 	old, file, err := load(dir)
 	if err != nil {
 		return nil, err
@@ -140,7 +135,7 @@ func Open(dir string, c Config, game Game) (*Room, error) {
 				return nil, errors.New("invalid stored event log")
 			}
 			if i > 0 {
-				r.state, err = game.Apply(bytes.Clone(r.state), bytes.Clone(e.Body))
+				r.state, err = g.Apply(bytes.Clone(r.state), bytes.Clone(e.Body))
 				if err != nil {
 					return nil, fmt.Errorf("replay %d: %w", e.Seq, err)
 				}

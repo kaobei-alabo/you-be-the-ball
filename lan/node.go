@@ -20,8 +20,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 
-	"you-be-the-ball.local/core/room"
-	"you-be-the-ball.local/core/session"
+	"github.com/kaobei-alabo/you-be-the-ball/room"
+	"github.com/kaobei-alabo/you-be-the-ball/session"
 )
 
 // Keep the v1 discovery name interoperable with pre-rename builds.

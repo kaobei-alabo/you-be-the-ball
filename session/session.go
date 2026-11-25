@@ -8,7 +8,7 @@ import (
 	"io"
 	"time"
 
-	"you-be-the-ball.local/core/room"
+	"github.com/kaobei-alabo/you-be-the-ball/room"
 )
 
 // Protocol stays unchanged so previously distributed clients can join the renamed CLI.

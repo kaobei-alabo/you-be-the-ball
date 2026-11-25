@@ -1,5 +1,5 @@
-// Package apphome locates the per-user CLI state. Never infer a peer identity from the working directory.
-package apphome
+// Package home locates the per-user CLI state. Never infer a peer identity from the working directory.
+package home
 
 import (
 	"bytes"

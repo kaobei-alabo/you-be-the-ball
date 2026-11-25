@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"you-be-the-ball.local/core/example/counter"
-	"you-be-the-ball.local/core/room"
+	"github.com/kaobei-alabo/you-be-the-ball/game/counter"
+	"github.com/kaobei-alabo/you-be-the-ball/room"
 )
 
 func fixture(t *testing.T) (*room.Room, *Client, string) {

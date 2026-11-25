@@ -4,9 +4,9 @@ import (
 	"context"
 	"testing"
 
-	"you-be-the-ball.local/core/example/counter"
-	"you-be-the-ball.local/core/room"
-	"you-be-the-ball.local/core/session"
+	"github.com/kaobei-alabo/you-be-the-ball/game/counter"
+	"github.com/kaobei-alabo/you-be-the-ball/room"
+	"github.com/kaobei-alabo/you-be-the-ball/session"
 )
 
 // Uses real encrypted libp2p TCP streams, not net.Pipe or a mocked peer ID.

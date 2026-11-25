@@ -5,21 +5,21 @@ import (
 	"path/filepath"
 	"testing"
 
-	"you-be-the-ball.local/core/example/counter"
-	"you-be-the-ball.local/core/room"
-	"you-be-the-ball.local/lan/internal/apphome"
+	"github.com/kaobei-alabo/you-be-the-ball/game/counter"
+	"github.com/kaobei-alabo/you-be-the-ball/internal/home"
+	"github.com/kaobei-alabo/you-be-the-ball/room"
 )
 
 func fakeHome(t *testing.T) string {
 	t.Helper()
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("USERPROFILE", home)
-	root, err := apphome.Root()
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
+	root, err := home.Root()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if root != filepath.Join(home, ".you-be-the-ball") {
+	if root != filepath.Join(dir, ".you-be-the-ball") {
 		t.Fatal(root)
 	}
 	return root

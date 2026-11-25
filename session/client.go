@@ -7,13 +7,14 @@ import (
 	"sync"
 	"time"
 
-	"you-be-the-ball.local/core/room"
+	"github.com/kaobei-alabo/you-be-the-ball/game"
+	"github.com/kaobei-alabo/you-be-the-ball/room"
 )
 
 // Client retains its replica across stream replacements; a new client can replay from zero.
 type Client struct {
 	mu               sync.Mutex
-	game             room.Game
+	game             game.Game
 	id, host, secret string
 	conn             Stream
 	info             room.Info
@@ -22,7 +23,7 @@ type Client struct {
 	expired          bool
 }
 
-func NewClient(g room.Game, id, host, secret string) *Client {
+func NewClient(g game.Game, id, host, secret string) *Client {
 	return &Client{game: g, id: id, host: host, secret: secret, state: bytes.Clone(g.Initial())}
 }
 

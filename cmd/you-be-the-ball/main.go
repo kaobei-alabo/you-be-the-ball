@@ -11,11 +11,11 @@ import (
 	"strings"
 	"time"
 
-	"you-be-the-ball.local/core/example/counter"
-	"you-be-the-ball.local/core/room"
-	"you-be-the-ball.local/core/session"
-	"you-be-the-ball.local/lan"
-	"you-be-the-ball.local/lan/internal/apphome"
+	"github.com/kaobei-alabo/you-be-the-ball/game/counter"
+	"github.com/kaobei-alabo/you-be-the-ball/internal/home"
+	"github.com/kaobei-alabo/you-be-the-ball/lan"
+	"github.com/kaobei-alabo/you-be-the-ball/room"
+	"github.com/kaobei-alabo/you-be-the-ball/session"
 )
 
 func main() {
@@ -38,7 +38,7 @@ type options struct {
 
 func parseOptions(root, mode string, args []string) (options, error) {
 	var o options
-	cfg, err := apphome.LoadConfig(root)
+	cfg, err := home.LoadConfig(root)
 	if err != nil {
 		return o, err
 	}
@@ -72,7 +72,7 @@ func parseOptions(root, mode string, args []string) (options, error) {
 		}
 		o.dir, err = filepath.Abs(o.dir)
 	} else {
-		o.dir, err = apphome.ProfileDir(root, *profile)
+		o.dir, err = home.ProfileDir(root, *profile)
 	}
 	return o, err
 }
@@ -90,7 +90,7 @@ func run(args []string) error {
 	default:
 		return errors.New(usage)
 	}
-	root, err := apphome.Root()
+	root, err := home.Root()
 	if err != nil {
 		return err
 	}
@@ -99,7 +99,7 @@ func run(args []string) error {
 			return errors.New("usage: you-be-the-ball migrate OLD_PROFILE_DIR [OLD_PROFILE_DIR ...] (stop old processes first)")
 		}
 		for _, src := range args[1:] {
-			dest, err := apphome.Migrate(root, src)
+			dest, err := home.Migrate(root, src)
 			if err != nil {
 				return err
 			}
