@@ -1,6 +1,26 @@
 # you-be-the-ball: a player-hosted room for Go games
 
-Original design proposal. See README.md for the implemented prototype, its limits, and the smoke test. The first target is a small room of native Go peers with one trusted player hosting. The core owns membership and replication of shared state; the game owns the meaning of a move. No dedicated game server is required. The first milestone is deliberately limited to a LAN.
+## Current design
+
+What is implemented now (see README.md for how to use it):
+
+- **Lobby on the creator.** Before the start, only the creator's program holds the room; guests take seats over the lobby protocol.
+- **Raft after the start.** The ordered event log is replicated with Raft (github.com/hashicorp/raft v1.8.0), in memory on every player. The host is the elected leader. A move counts once a majority of voters hold it, so there are never two hosts whose moves can count.
+- **Random successor.** Raft's randomized election timeouts pick the next host when the current one drops out; a host that quits hands over to a random other voter first (with two players there is none). The creator is the first host.
+- **Two players.** Only the creator votes: if the guest drops, the host plays on and the guest catches up; if the host drops, the game pauses; if the host's program closes, the game ends as `interrupted` for both.
+- **One replication address per run.** Each run of the program uses `<peerID>/<roomID>/<nonce>` as its Raft address, so a restarted program with an empty memory cannot be mistaken for its old self.
+- **A record at the end.** Each player writes `games/<roomID>.json` once, when the game finishes or expires or when it leaves mid-game. Nothing is written per move.
+- **One game per build.** A second selectable game needs a game name in `room.Config` and `Setup`, checked on join.
+
+These statements in the proposal below no longer hold:
+
+- A move is durable because a majority of players hold it in memory; nothing is written per move.
+- Hosts change: if the host drops out, the others elect one (not with two players). No game resumes from disk, and a player whose program restarted cannot reclaim its seat.
+- Records are kept until the user deletes them. The proposal purged everything at expiry; whether records should be purged too is an open question.
+
+## Original design proposal
+
+See README.md for the implemented prototype, its limits, and the offline demo. The first target is a small room of native Go peers with one trusted player hosting. The core owns membership and replication of shared state; the game owns the meaning of a move. No dedicated game server is required. The first milestone is deliberately limited to a LAN.
 
 ## What a game can ask for
 
