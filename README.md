@@ -42,14 +42,15 @@ Then type these commands into the running processes, in order:
 | Carol | `inc carol-1` | `committed carol-1 at v3`. |
 | Bob | `inc bob-1` | `committed bob-1 at v2` again: the retry returns the original receipt. |
 | Alice | `online`, then `status` | `* host is now …`, then `version=3 counter=2`, like the others. |
+| Bob | `invite` | `Invite: …`, a token for a player whose program restarted (see Quitting). |
 | New host | `finish` | `Finished`. Every player prints `* game finished; record saved to …`. `quit` exits. |
 
-With two players only the creator hosts. If the guest goes offline, the host keeps playing and the guest catches up when it returns. If the host goes offline, the guest's moves fail and `status` shows `paused` until the host is back. If the host quits, the game ends for both: each records it as `interrupted`, and the guest prints `* room closed` (a guest that is offline at that moment stays paused until it quits too).
+With two players only the creator hosts. If the guest goes offline, the host keeps playing and the guest catches up when it returns. If the host goes offline, the guest's moves fail and `status` shows `paused` until the host is back. If the host quits, the game ends for both: each records it as `interrupted`, and the guest prints `* room closed` (a guest that is offline at that moment stays paused until it quits too). A guest whose program restarted can rejoin (see Quitting); the creator cannot: once its program has closed, the game is over.
 
 - **One machine:** give every player its own profile and pass `-listen /ip4/127.0.0.1/tcp/0` (and `-mdns=false` to the host), for example `join -profile carol -listen /ip4/127.0.0.1/tcp/0 'TOKEN'`.
 - **Nothing found:** `find` browses for 8 seconds and lists only public lobbies that are not full. Otherwise paste the host's invite. The host listens on TCP 42042 by default; the other players on a random port.
 - **Private rooms:** `host -private` is not advertised and needs the full invite, which carries a secret. Share it only with intended players.
-- **Quitting:** with three or more players, a host that quits hands over to another player first. Nobody can take a seat once the game has started, so a player who quits, or whose program restarts, cannot come back to that game.
+- **Quitting and coming back:** with three or more players, a host that quits hands over to another player first. Nobody new can take a seat once the game has started, but a player who quit, or whose program restarted, comes back with `join -profile <the profile it played with>` (`host` for the creator by default) and the invite of a player whose program is still running: the original one while the creator's first program runs, otherwise a fresh one from any player's `invite` command (a player's invite goes stale when its program restarts). It prints `Rejoined at v…`. This needs a host, so most of the other players must be online, and it does not apply to the creator of a two-player game.
 
 ## Where game data is stored
 
@@ -64,7 +65,7 @@ By default, everything the CLI writes goes under `.you-be-the-ball` in your home
   find/identity.key           # LAN browser identity
 ```
 
-- **Profiles:** each subcommand uses the folder named after it, created on first use. The CLI prints `Data directory:` at startup. `-profile NAME` uses `~/.you-be-the-ball/NAME/` instead, for a second room or player on one machine. Run only one process per profile.
+- **Profiles:** each subcommand uses the folder named after it, created on first use. The CLI prints `Data directory:` at startup. `-profile NAME` uses `~/.you-be-the-ball/NAME/` instead, for a second room or player on one machine. Run only one process per profile: in a started game a second one takes the seat from the first, which stops counting and shows `paused`, while the second may fail to rejoin. If another player is offline then, the game pauses for everyone until that player is back. To recover, stop both and rejoin once.
 - **Nothing is written while playing.** Every player keeps the game in memory. Each player writes `games/<roomID>.json` in its own profile once, when the game finishes or expires, or with status `interrupted` when that player quits mid-game.
 - **Reading a record:** `jq '{Status, Version, Players}' ~/.you-be-the-ball/host/games/*.json` shows the outcome; `.Events` is the full move list, and `jq -r '.State | @base64d'` shows the final game state. A record holds no invite secret.
 - **Keep `identity.key` private.** It is the player's private key and stays across games. Delete a profile folder to start fresh.

@@ -120,6 +120,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 			return err
 		}
 		defer p.Close()
+		if s := p.Status(); s.Phase != lan.Lobby { // this player's program had restarted
+			fmt.Fprintf(stdout, "Rejoined at v%d\n", s.Version)
+		}
 	}
 	return repl(p, n, mode == "host", stdin, stdout)
 }

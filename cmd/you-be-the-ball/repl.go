@@ -54,7 +54,7 @@ func repl(p *lan.Player, n *lan.Node, creator bool, stdin io.Reader, stdout io.W
 	done := make(chan struct{})
 	go func() { defer close(done); notices(p, me, o, stop) }()
 	defer func() { close(stop); <-done }()
-	o.println("Commands: status | start (host) |", play.word, "[request-id] | finish (host) | offline | online | quit")
+	o.println("Commands: status | start (host) |", play.word, "[request-id] | finish (host) | invite | offline | online | quit")
 	scan := bufio.NewScanner(stdin)
 	for scan.Scan() {
 		f := strings.Fields(scan.Text())
@@ -96,6 +96,14 @@ func repl(p *lan.Player, n *lan.Node, creator bool, stdin io.Reader, stdout io.W
 				o.println("Finished")
 			}
 			cancel()
+		case "invite":
+			var inv lan.Invite
+			if inv, err = p.Invite(); err == nil {
+				var text string
+				if text, err = inv.Encode(); err == nil {
+					o.println("Invite:", text)
+				}
+			}
 		case "offline", "online":
 			n.SetOffline(f[0] == "offline")
 			o.println(strings.ToUpper(f[0][:1]) + f[0][1:])

@@ -50,13 +50,23 @@ func Host(n *Node, g game.Game, c room.Config, o Options) (*Player, error) {
 	return p, n.add(p)
 }
 
-// Join returns once seated in the lobby of the invite.
+// Join returns once seated in the lobby of the invite. If the game has started,
+// a player whose program restarted takes its place back (see rejoin) and Join
+// returns once this copy is up to date and playing.
 func Join(ctx context.Context, n *Node, g game.Game, inv Invite, o Options) (*Player, error) {
 	p := newPlayer(n, g, o, inv.Room)
 	if err := n.add(p); err != nil {
 		return nil, err
 	}
 	s, r, err := p.join(ctx, inv)
+	if err == nil && r.Started {
+		_ = s.Close()
+		if err = p.rejoin(ctx, inv.Host.ID); err != nil {
+			p.stop(false)
+			return nil, err
+		}
+		return p, nil
+	}
 	if err == nil && r.Err != "" {
 		err = errors.New(r.Err)
 	} else if err == nil && r.Lobby == nil {
@@ -86,8 +96,11 @@ func (p *Player) join(ctx context.Context, inv Invite) (network.Stream, reply, e
 	if err != nil {
 		return nil, r, err
 	}
+	if inv.Host.ID == p.n.ID() {
+		return nil, r, errors.New("this is your own invite; ask another player for a fresh one")
+	}
 	if err = p.n.h.Connect(ctx, inv.Host); err != nil {
-		return nil, r, fmt.Errorf("reach the room's host: %w", err)
+		return nil, r, fmt.Errorf("reach the player who gave the invite (after the start, any player still in the game can give a fresh one): %w", err)
 	}
 	s, err := p.n.h.NewStream(ctx, inv.Host.ID, lobbyProto)
 	if err != nil && strings.Contains(err.Error(), "protocols not supported") {
@@ -138,7 +151,7 @@ func (p *Player) follow(up *link, host peer.ID) {
 			p.stop(false)
 			return
 		case r.Setup != nil:
-			if s := *r.Setup; p.replica() != nil || s.ID != p.id || len(s.Roster) == 0 || s.Roster[0].Peer != host.String() || p.begin(s) != nil {
+			if s := *r.Setup; p.replica() != nil || s.ID != p.id || len(s.Roster) == 0 || s.Roster[0].Peer != host.String() || p.begin(s, false) != nil {
 				p.stop(false)
 				return
 			}
@@ -187,7 +200,9 @@ func (p *Player) admit(s network.Stream, from peer.ID, q request) {
 	p.broadcast()
 }
 
-func (p *Player) seat(l *link, from peer.ID, q request) error {
+// checkRun vets what a caller says about its run: the replication address must
+// be its own, in this room, and its listen addresses few and valid.
+func (p *Player) checkRun(from peer.ID, q request) error {
 	prefix := from.String() + "/" + p.id + "/"
 	if _, _, err := parseAddress(q.Node); err != nil || !strings.HasPrefix(q.Node, prefix) || len(q.Node) > 512 {
 		return errors.New("invalid replication address")
@@ -200,6 +215,13 @@ func (p *Player) seat(l *link, from peer.ID, q request) error {
 			return err
 		}
 	}
+	return nil
+}
+
+func (p *Player) seat(l *link, from peer.ID, q request) error {
+	if err := p.checkRun(from, q); err != nil {
+		return err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	switch {
@@ -208,7 +230,7 @@ func (p *Player) seat(l *link, from peer.ID, q request) error {
 	case p.closed:
 		return errClosed
 	case p.started:
-		return fmt.Errorf("the game has %w; it cannot be rejoined", room.ErrStarted)
+		return room.ErrStarted
 	}
 	seat, err := p.lobby.Join(room.Member{Peer: from.String(), Addrs: q.Addrs, Node: q.Node}, q.Room, q.Secret)
 	if err != nil {
@@ -244,9 +266,20 @@ func (p *Player) broadcast() {
 	p.signal()
 }
 
-// Invite is the lobby creator's invite, valid until the start.
+// Invite is the creator's invite in the lobby. After the start any player's
+// invite lets a player whose program restarted come back; it carries no
+// secret, since only the roster is admitted then.
 func (p *Player) Invite() (Invite, error) {
-	if p.lobby == nil {
+	p.mu.Lock()
+	closed, started := p.closed, p.state != nil
+	p.mu.Unlock()
+	switch {
+	case closed:
+		return Invite{}, errClosed
+	case started:
+		addrs, err := p.n.addrs()
+		return Invite{Room: p.id, Host: peer.AddrInfo{ID: p.n.ID(), Addrs: addrs}}, err
+	case p.lobby == nil:
 		return Invite{}, errors.New("only the room's creator has its invite")
 	}
 	id, secret, err := p.lobby.Invite()
@@ -311,7 +344,7 @@ func (p *Player) Start(ctx context.Context) error {
 			return fail(errors.New("not every player got ready"))
 		}
 	}
-	if err := p.begin(setup); err != nil {
+	if err := p.begin(setup, false); err != nil {
 		return fail(err)
 	}
 	r := p.replica()

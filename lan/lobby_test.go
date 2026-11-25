@@ -93,7 +93,7 @@ func TestLobbyOverTheNetwork(t *testing.T) {
 	if err := h.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := join(t, newNode(t, t.TempDir()), inv, o); err == nil || !strings.Contains(err.Error(), "already started") {
+	if _, err := join(t, newNode(t, t.TempDir()), inv, o); err == nil || !strings.Contains(err.Error(), "not a player in this game") {
 		t.Fatal("joined a started game:", err)
 	}
 

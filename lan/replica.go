@@ -43,8 +43,9 @@ func servers(s room.Setup) []raft.Server {
 }
 
 // begin builds this member's copy of the game and its raft node, with empty
-// stores and no configuration: only the creator bootstraps the cluster.
-func (p *Player) begin(setup room.Setup) error {
+// stores and no configuration: only the creator bootstraps the cluster. On a
+// rejoin the roster still names this player's old run, which the host replaces.
+func (p *Player) begin(setup room.Setup, rejoin bool) error {
 	st, err := room.NewState(setup, p.g)
 	if err != nil {
 		return err
@@ -58,7 +59,7 @@ func (p *Player) begin(setup room.Setup) error {
 		}
 		roster[id] = true
 		if id == p.n.ID() {
-			mine = m.Node == p.self
+			mine = rejoin || m.Node == p.self
 			continue
 		}
 		for _, a := range m.Addrs {

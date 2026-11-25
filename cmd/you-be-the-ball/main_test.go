@@ -401,3 +401,65 @@ func TestGuestOfAClosedLobby(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+// quit types "quit" and waits until run returns.
+func (c *cli) quit() {
+	c.t.Helper()
+	fmt.Fprintln(c.in, "quit")
+	for {
+		select {
+		case _, ok := <-c.answer:
+			if !ok {
+				return
+			}
+		case <-time.After(30 * time.Second):
+			c.t.Fatalf("%s did not quit", c.name)
+		}
+	}
+}
+
+// A player comes back with "join" on the same profile. Its REPL is left with
+// "quit", a graceful leave: run() cannot be killed abruptly in a test. That
+// keeps its raft server in the game just as a crash does.
+func TestPlayerRejoinsWithTheSameProfile(t *testing.T) {
+	fakeHome(t)
+	fastCLI(t)
+	alice := launch(t, "alice", "host", "-players", "3")
+	bob := launch(t, "bob", "join", alice.invite)
+	carol := launch(t, "carol", "join", alice.invite)
+	alice.until("status", "online=3/3")
+	if got := alice.do("invite"); !strings.HasPrefix(got, "Invite: ") {
+		t.Fatal(got)
+	}
+	if got := bob.do("invite"); got != "error: only the room's creator has its invite" {
+		t.Fatal(got)
+	}
+	if got := alice.do("start"); got != "Started" {
+		t.Fatal(got)
+	}
+	carol.notice(0, "* game started")
+	bob.until("inc b1", "committed b1 at v2")
+	carol.until("inc c1", "committed c1 at v3")
+
+	carol.quit()
+	carol = launch(t, "carol", "join", alice.invite)
+	if carol.count("Rejoined at v3") != 1 {
+		t.Fatal("no rejoin greeting")
+	}
+	carol.until("status", "phase=playing host=", "version=3 counter=2")
+	carol.until("inc c2", "committed c2 at v4")
+	bob.until("status", "version=4 counter=3")
+
+	// Any player's invite works after the start.
+	token, ok := strings.CutPrefix(bob.do("invite"), "Invite: ")
+	if !ok {
+		t.Fatal("no invite from bob")
+	}
+	carol.quit()
+	carol = launch(t, "carol", "join", token)
+	carol.until("inc c3", "committed c3 at v5")
+	alice.until("status", "version=5 counter=4")
+	if carol.count("Rejoined at v4") != 1 || carol.count("* game started") != 0 {
+		t.Fatal("wrong rejoin output")
+	}
+}

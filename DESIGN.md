@@ -9,13 +9,14 @@ What is implemented now (see README.md for how to use it):
 - **Random successor.** Raft's randomized election timeouts pick the next host when the current one drops out; a host that quits hands over to a random other voter first (with two players there is none). The creator is the first host.
 - **Two players.** Only the creator votes: if the guest drops, the host plays on and the guest catches up; if the host drops, the game pauses; if the host's program closes, the game ends as `interrupted` for both.
 - **One replication address per run.** Each run of the program uses `<peerID>/<roomID>/<nonce>` as its Raft address, so a restarted program with an empty memory cannot be mistaken for its old self.
+- **Rejoining after a restart.** A restarted program joins again with the same identity and a new replication address. Any member tells it where the host is; only the host sends it the Setup (a different one from a later answer fails the rejoin) and where the other members are now. The host removes the old run's Raft server, adds the new one as a nonvoter and, once it holds the host's version, makes it a voter again if its seat votes. This needs a host.
 - **A record at the end.** Each player writes `games/<roomID>.json` once, when the game finishes or expires or when it leaves mid-game. Nothing is written per move.
 - **One game per build.** A second selectable game needs a game name in `room.Config` and `Setup`, checked on join.
 
 These statements in the proposal below no longer hold:
 
 - A move is durable because a majority of players hold it in memory; nothing is written per move.
-- Hosts change: if the host drops out, the others elect one (not with two players). No game resumes from disk, and a player whose program restarted cannot reclaim its seat.
+- Hosts change: if the host drops out, the others elect one (not with two players). No game resumes from disk: a player whose program restarted gets its seat back from the other players' memory, through the host.
 - Records are kept until the user deletes them. The proposal purged everything at expiry; whether records should be purged too is an open question.
 
 ## Original design proposal

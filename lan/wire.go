@@ -23,24 +23,29 @@ const (
 	timeout    = 5 * time.Second
 )
 
+var errNoRoom = errors.New("no such room or operation")
+
 // request is what a peer asks. The actor is always the stream's authenticated
 // remote peer, never a field here.
 type request struct {
 	Op               string
 	Room, Secret, ID string   `json:",omitempty"`
-	Node             string   `json:",omitempty"` // join: the guest's replication address
-	Addrs            []string `json:",omitempty"` // join: the guest's listen addresses
+	Node             string   `json:",omitempty"` // join, rejoin: the caller's replication address
+	Addrs            []string `json:",omitempty"` // join, rejoin: the caller's listen addresses
 	Body             []byte   `json:",omitempty"`
-	Seq              int      `json:",omitempty"` // closed: the host's version
+	Seq              int      `json:",omitempty"` // closed: the host's version; rejoin: the caller's
 }
 
 type reply struct {
-	Err      string          `json:",omitempty"`
-	Lobby    *room.LobbyInfo `json:",omitempty"`
-	Setup    *room.Setup     `json:",omitempty"`
-	Seq      int             `json:",omitempty"`
-	Redirect string          `json:",omitempty"` // peer ID of the host
-	Retry    bool            `json:",omitempty"`
+	Err      string              `json:",omitempty"`
+	Lobby    *room.LobbyInfo     `json:",omitempty"`
+	Setup    *room.Setup         `json:",omitempty"`
+	Seq      int                 `json:",omitempty"`
+	Redirect string              `json:",omitempty"` // peer ID of the host
+	Retry    bool                `json:",omitempty"`
+	Started  bool                `json:",omitempty"` // join: the game has started; rejoin instead
+	Done     bool                `json:",omitempty"` // rejoin: the caller has its place back
+	Peers    map[string][]string `json:",omitempty"` // rejoin: where the host reaches each member
 }
 
 func send(w io.Writer, v any) error {
@@ -110,9 +115,13 @@ func (n *Node) serve(s network.Stream) {
 		if err != nil {
 			r = reply{Err: err.Error()}
 		}
+	case q.Op == "join" && p != nil && p.begun():
+		r = reply{Started: true}
 	case q.Op == "join" && p != nil:
 		p.admit(s, from, q) // owns the stream from here on
 		return
+	case q.Op == "rejoin" && p != nil:
+		r = p.serveRejoin(from, q)
 	case q.Op == "submit" && p != nil:
 		r = p.serveSubmit(from, q)
 	case q.Op == "closed" && p != nil:
@@ -120,7 +129,7 @@ func (n *Node) serve(s network.Stream) {
 	case q.Op == "join":
 		r = reply{Err: room.ErrInvite.Error()}
 	default:
-		r = reply{Err: "no such room or operation"}
+		r = reply{Err: errNoRoom.Error()}
 	}
 	_ = s.SetWriteDeadline(time.Now().Add(timeout))
 	_ = send(s, r)

@@ -84,7 +84,8 @@ type Player struct {
 
 	seats     sync.Mutex // orders lobby broadcasts
 	proposing sync.Mutex
-	barrier   uint64 // term in which a Barrier last succeeded
+	rejoining sync.Mutex // one membership change at a time (rejoin.go)
+	barrier   uint64     // term in which a Barrier last succeeded
 }
 
 func newPlayer(n *Node, g game.Game, o Options, id string) *Player {
@@ -117,6 +118,23 @@ func (p *Player) replica() *raft.Raft {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.raft
+}
+
+// begun: the game has started here, so a join must become a rejoin.
+func (p *Player) begun() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.started || p.state != nil
+}
+
+// version is this copy's version; 0 before it has one.
+func (p *Player) version() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.state == nil {
+		return 0
+	}
+	return p.state.Info().Version
 }
 
 func listen(n *Node) ([]string, error) {
