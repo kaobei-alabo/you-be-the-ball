@@ -11,3 +11,9 @@ type Game interface {
 	Decide(state []byte, actor string, command []byte) ([]byte, error)
 	Apply(state []byte, event []byte) ([]byte, error)
 }
+
+// Finisher is optional. A game that implements it ends itself: once Finished
+// reports true the room accepts no more commands. It must be deterministic.
+type Finisher interface {
+	Finished(state []byte) bool
+}

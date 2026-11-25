@@ -1,13 +1,18 @@
 package main
 
 import (
+	"bufio"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
-	"github.com/kaobei-alabo/you-be-the-ball/game/counter"
 	"github.com/kaobei-alabo/you-be-the-ball/internal/home"
-	"github.com/kaobei-alabo/you-be-the-ball/room"
+	"github.com/kaobei-alabo/you-be-the-ball/lan"
 )
 
 func fakeHome(t *testing.T) string {
@@ -35,7 +40,7 @@ func TestHomeProfilesIgnoreWorkingDirectory(t *testing.T) {
 			if mode == "join" {
 				args = []string{"invite"}
 			}
-			o, err := parseOptions(root, mode, args)
+			o, err := parseOptions(io.Discard, root, mode, args)
 			if err != nil || o.dir != filepath.Join(root, mode) {
 				t.Fatalf("%s: %+v, %v", mode, o, err)
 			}
@@ -45,17 +50,17 @@ func TestHomeProfilesIgnoreWorkingDirectory(t *testing.T) {
 			t.Fatal("unexpected working directory state", entries, err)
 		}
 	}
-	custom, err := parseOptions(root, "host", []string{"-profile", "colleague-test"})
+	custom, err := parseOptions(io.Discard, root, "host", []string{"-profile", "colleague-test"})
 	if err != nil || custom.dir != filepath.Join(root, "colleague-test") {
 		t.Fatal(custom, err)
 	}
 	for _, args := range [][]string{{"-profile", "../not-a-profile"}, {"-profile", "."}, {"-profile", ""}, {"-profile", "alice", "-dir", "."}, {"-dir", ""}} {
-		if _, err := parseOptions(root, "host", args); err == nil {
+		if _, err := parseOptions(io.Discard, root, "host", args); err == nil {
 			t.Fatal("accepted", args)
 		}
 	}
 	explicit := t.TempDir()
-	custom, err = parseOptions(root, "host", []string{"-dir", explicit})
+	custom, err = parseOptions(io.Discard, root, "host", []string{"-dir", explicit})
 	if err != nil || custom.dir != explicit {
 		t.Fatal(custom, err)
 	}
@@ -70,15 +75,20 @@ func TestHomeConfigAndFlagPrecedence(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"players":4,"private":true,"mdns":false,"host_listen":"/ip4/127.0.0.1/tcp/42345"}`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	h, err := parseOptions(root, "host", nil)
+	h, err := parseOptions(io.Discard, root, "host", nil)
 	if err != nil || !h.private || h.mdns || h.players != 4 || h.listen != "/ip4/127.0.0.1/tcp/42345" {
 		t.Fatal(h, err)
 	}
-	h, err = parseOptions(root, "host", []string{"-players", "3", "-private=false", "-mdns"})
+	h, err = parseOptions(io.Discard, root, "host", []string{"-players", "3", "-private=false", "-mdns"})
 	if err != nil || h.private || !h.mdns || h.players != 3 {
 		t.Fatal(h, err)
 	}
-	peer, err := parseOptions(root, "join", []string{"invite"})
+	for flags, want := range map[string]string{"-players 1": "-players must be 2..32", "-players 33": "-players must be 2..32", "-ttl 100h": "-ttl must be in (0,72h]"} {
+		if _, err := parseOptions(io.Discard, root, "host", strings.Fields(flags)); err == nil || err.Error() != want {
+			t.Fatal(flags, err)
+		}
+	}
+	peer, err := parseOptions(io.Discard, root, "join", []string{"invite"})
 	if err != nil || peer.listen != "/ip4/0.0.0.0/tcp/0" {
 		t.Fatal(peer, err)
 	}
@@ -86,48 +96,31 @@ func TestHomeConfigAndFlagPrecedence(t *testing.T) {
 		if err := os.WriteFile(path, []byte(invalid), 0600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := parseOptions(root, "host", nil); err == nil {
+		if _, err := parseOptions(io.Discard, root, "host", nil); err == nil {
 			t.Fatalf("accepted invalid config: %s", invalid)
 		}
 	}
 }
 
-func TestMigrateResumesRoomWithoutOverwriting(t *testing.T) {
+// An old profile keeps its identity; its room.json moves along but is not used.
+func TestMigrateMovesIdentityWithoutOverwriting(t *testing.T) {
 	root := fakeHome(t)
 	old := filepath.Join(t.TempDir(), ".p2p-host")
-	cfg := room.Config{Host: "host", Players: 2}
-	r, err := room.Open(old, cfg, counter.Game{})
-	if err != nil {
+	if err := os.Mkdir(old, 0700); err != nil {
 		t.Fatal(err)
 	}
-	id, sec, err := r.Invite()
-	if err != nil {
-		t.Fatal(err)
+	for name, body := range map[string]string{"identity.key": "fixture-key", "room.json": "{}"} {
+		if err := os.WriteFile(filepath.Join(old, name), []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if _, err := r.Join("guest", id, sec); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.Start(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.Submit("before-rename", []byte("inc")); err != nil {
-		t.Fatal(err)
-	}
-	before, _, err := r.View()
-	if err != nil {
-		t.Fatal(err)
-	}
-	r.Close()
-	if err := os.WriteFile(filepath.Join(old, "identity.key"), []byte("fixture-key"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := run([]string{"migrate", old}); err != nil {
+	if err := run([]string{"migrate", old}, nil, io.Discard, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(old); !os.IsNotExist(err) {
 		t.Fatal("old dir still present", err)
 	}
-	o, err := parseOptions(root, "host", nil)
+	o, err := parseOptions(io.Discard, root, "host", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,22 +128,13 @@ func TestMigrateResumesRoomWithoutOverwriting(t *testing.T) {
 	if err != nil || string(key) != "fixture-key" {
 		t.Fatal("identity was not preserved", err)
 	}
-	r, err = room.Open(o.dir, cfg, counter.Game{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r.Close()
-	after, state, err := r.View()
-	if err != nil || after.ID != before.ID || !after.Expires.Equal(before.Expires) || after.Version != before.Version || string(state) != "1" {
-		t.Fatal(after, string(state), err)
-	}
 	if err := os.Mkdir(old, 0700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(old, "identity.key"), []byte("different-key"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := run([]string{"migrate", old}); err == nil {
+	if err := run([]string{"migrate", old}, nil, io.Discard, io.Discard); err == nil {
 		t.Fatal("allowed overwrite")
 	}
 	key, err = os.ReadFile(filepath.Join(o.dir, "identity.key"))
@@ -159,5 +143,261 @@ func TestMigrateResumesRoomWithoutOverwriting(t *testing.T) {
 	}
 	if _, err := os.Stat(old); err != nil {
 		t.Fatal("source lost", err)
+	}
+}
+
+// cli is one player's run() driven through pipes, as if typed in a terminal.
+type cli struct {
+	t      *testing.T
+	name   string
+	in     *io.PipeWriter
+	answer chan string // every line except notices and request-ID hints
+	invite string
+	mu     sync.Mutex
+	lines  []string
+}
+
+func fastCLI(t *testing.T) {
+	oldT, oldM := timing, moveTimeout
+	timing = lan.Timing{Heartbeat: 100 * time.Millisecond, Lease: 50 * time.Millisecond, Commit: 2 * time.Millisecond}
+	moveTimeout = 3 * time.Second
+	t.Cleanup(func() { timing, moveTimeout = oldT, oldM })
+}
+
+func launch(t *testing.T, name string, args ...string) *cli {
+	t.Helper()
+	args = append(args[:1:1], append([]string{"-profile", name, "-listen", "/ip4/127.0.0.1/tcp/0", "-mdns=false"}, args[1:]...)...)
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	c := &cli{t: t, name: name, in: inW, answer: make(chan string, 100)}
+	done := make(chan error, 1)
+	go func() {
+		err := run(args, inR, outW, io.Discard)
+		outW.Close()
+		done <- err
+	}()
+	go func() {
+		s := bufio.NewScanner(outR)
+		for s.Scan() {
+			line := s.Text()
+			c.mu.Lock()
+			c.lines = append(c.lines, line)
+			c.mu.Unlock()
+			if !strings.HasPrefix(line, "* ") && !strings.HasPrefix(line, "request ID") {
+				c.answer <- line
+			}
+		}
+		close(c.answer)
+	}()
+	t.Cleanup(func() {
+		inW.Close()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("%s: %v", name, err)
+			}
+		case <-time.After(30 * time.Second):
+			t.Errorf("%s did not quit", name)
+		}
+	})
+	for {
+		line := c.next()
+		if strings.HasPrefix(line, "Invite: ") {
+			c.invite = strings.TrimPrefix(line, "Invite: ")
+		}
+		if strings.HasPrefix(line, "Commands:") {
+			return c
+		}
+	}
+}
+
+func (c *cli) next() string {
+	c.t.Helper()
+	select {
+	case line, ok := <-c.answer:
+		if !ok {
+			c.t.Fatalf("%s exited", c.name)
+		}
+		return line
+	case <-time.After(40 * time.Second):
+		c.t.Fatalf("%s: no answer", c.name)
+	}
+	return ""
+}
+
+// do types one command and returns its answer.
+func (c *cli) do(cmd string) string {
+	c.t.Helper()
+	if _, err := fmt.Fprintln(c.in, cmd); err != nil {
+		c.t.Fatal(err)
+	}
+	return c.next()
+}
+
+// until repeats cmd until its answer contains every want, for up to 30 s.
+func (c *cli) until(cmd string, want ...string) string {
+	c.t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		line := c.do(cmd)
+		ok := true
+		for _, w := range want {
+			ok = ok && strings.Contains(line, w)
+		}
+		if ok {
+			return line
+		}
+		if time.Now().After(deadline) {
+			c.t.Fatalf("%s %q: got %q, want %q", c.name, cmd, line, want)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (c *cli) mark() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.lines)
+}
+
+// notice waits for a printed line starting with prefix after mark.
+func (c *cli) notice(mark int, prefix string) string {
+	c.t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		c.mu.Lock()
+		for _, l := range c.lines[mark:] {
+			if strings.HasPrefix(l, prefix) {
+				c.mu.Unlock()
+				return l
+			}
+		}
+		c.mu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+	}
+	c.t.Fatalf("%s: no %q", c.name, prefix)
+	return ""
+}
+
+func (c *cli) count(prefix string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, l := range c.lines {
+		if strings.HasPrefix(l, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+func TestThreePlayersHostChange(t *testing.T) {
+	root := fakeHome(t)
+	fastCLI(t)
+	alice := launch(t, "alice", "host", "-players", "3")
+	bob := launch(t, "bob", "join", alice.invite)
+	carol := launch(t, "carol", "join", alice.invite)
+	all := []*cli{alice, bob, carol}
+	alice.until("status", "phase=lobby online=3/3 expires=")
+	if got := bob.do("start"); got != "error: only the host can start" {
+		t.Fatal(got)
+	}
+	if got := alice.do("start"); got != "Started" {
+		t.Fatal(got)
+	}
+	for _, c := range all {
+		c.notice(0, "* game started")
+	}
+	bob.until("inc b1", "committed b1 at v2")
+	carol.until("inc c1", "committed c1 at v3")
+
+	marks := []int{bob.mark(), carol.mark()}
+	if got := alice.do("offline"); got != "Offline" {
+		t.Fatal(got)
+	}
+	for i, c := range all[1:] {
+		c.notice(marks[i], "* host is now")
+	}
+	alice.notice(0, "* paused: no host reachable")
+	for _, c := range all[1:] {
+		if n := c.count("* paused"); n != 0 {
+			t.Fatal(c.name, "told of a pause during a quick host change")
+		}
+	}
+	bob.until("inc b2", "committed b2 at v4")
+	bob.until("inc b1", "committed b1 at v2") // a retry returns the original receipt
+	if got := alice.do("online"); got != "Online" {
+		t.Fatal(got)
+	}
+	if line := alice.until("status", "phase=playing", "version=4 counter=3"); strings.Contains(line, "host=me") {
+		t.Fatal("the old host is host again:", line)
+	}
+
+	host := bob
+	if !strings.Contains(bob.until("status", "phase=playing"), "host=me") {
+		host = carol
+	}
+	if got := host.do("finish"); got != "Finished" {
+		t.Fatal(got)
+	}
+	for _, c := range all {
+		line := c.until("status", "phase=finished", "version=5 counter=3", "record=")
+		rec := line[strings.Index(line, "record=")+len("record="):]
+		if filepath.Dir(filepath.Dir(rec)) != filepath.Join(root, c.name) {
+			t.Fatal("record outside the profile:", rec)
+		}
+		if _, err := os.Stat(rec); err != nil {
+			t.Fatal(err)
+		}
+		c.notice(0, "* game finished; record saved to "+rec)
+		if n := c.count("* game started"); n != 1 {
+			t.Fatalf("%s: %d start notices", c.name, n)
+		}
+	}
+}
+
+// With two players only the creator hosts: the guest never takes over.
+func TestTwoPlayersHostStaysInCharge(t *testing.T) {
+	fakeHome(t)
+	fastCLI(t)
+	alice := launch(t, "alice", "host", "-players", "2")
+	bob := launch(t, "bob", "join", alice.invite)
+	alice.until("status", "online=2/2")
+	if got := alice.do("start"); got != "Started" {
+		t.Fatal(got)
+	}
+	bob.notice(0, "* game started")
+
+	bob.do("offline")
+	alice.until("inc a1", "committed a1 at v2")
+	bob.do("online")
+	bob.until("status", "version=2 counter=1")
+
+	alice.do("offline")
+	if got := bob.do("inc b1"); !strings.HasPrefix(got, "error: ") {
+		t.Fatal(got)
+	}
+	bob.until("status", "phase=playing host=none version=2", "paused")
+	alice.do("online")
+	bob.until("inc b1", "committed b1 at v3")
+	alice.until("status", "host=me version=3 counter=2")
+
+	// The host quits: the game ends for both.
+	m := bob.mark()
+	fmt.Fprintln(alice.in, "quit")
+	bob.notice(m, "* room closed")
+	bob.until("status", "phase=closed")
+}
+
+func TestGuestOfAClosedLobby(t *testing.T) {
+	fakeHome(t)
+	fastCLI(t)
+	alice := launch(t, "alice", "host", "-players", "3")
+	bob := launch(t, "bob", "join", alice.invite)
+	alice.until("status", "online=2/3")
+	fmt.Fprintln(alice.in, "quit")
+	bob.notice(0, "* room closed")
+	if got := bob.do("status"); got != "phase=closed" {
+		t.Fatal(got)
 	}
 }
