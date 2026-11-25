@@ -1,8 +1,8 @@
 # you-be-the-ball
 
-A Go prototype for small, player-hosted rooms. One player creates the room and starts it when the required players are connected. The host orders accepted changes; guests replay them. The shared counter is a test game, not a dependency of the library.
+A Go prototype for small, player-hosted game rooms on a LAN. One player hosts the room and starts it once everyone is connected. The host orders accepted changes; guests replay them. The bundled counter is a test game, not part of the library.
 
-## See sync work without a network
+## Offline demo
 
 From the project root, with Go 1.24 or newer:
 
@@ -11,92 +11,88 @@ go run ./cmd/demo
 go test -race ./...
 ```
 
-Alice hosts; Bob joins, increments, and disconnects. Alice increments while he is away. Bob reconnects and retries his original command. The expected final line is **`Host: counter=2 v3; guest: counter=2 v3`**: one start event and two distinct increments. This uses the same framed session protocol as the network adapter but runs over `net.Pipe`. It does not test discovery or real sockets.
+The demo runs a host and a guest over an in-memory pipe, including a disconnect and a retried command. It ends with `Host: counter=2 v3; guest: counter=2 v3`.
 
-## Try two terminals or two laptops
+## LAN quick start
 
-On each machine, in `lan/`, use Go 1.26.x (or a newer compatible Go toolchain). This separate module keeps the core and offline tests free of networking dependencies. First setup needs access to the Go module proxy:
+Build the CLI with Go 1.26 or newer. The first build downloads modules:
 
 ```sh
 cd lan
-go mod tidy
-go test -race ./...           # includes TestLoopbackCounter over real TCP/libp2p
-mkdir -p ../bin
 go build -o ../bin/you-be-the-ball ./cmd/you-be-the-ball
+cd ..
 ```
 
-If you have existing `.p2p-*` data you want to keep, **migrate it before starting the new binary** (below). For a new game, run the following from the project root in separate terminals. You can also copy just the binary to another machine of the same OS/architecture; the binary does not look for a checkout when it starts:
+Run each player in their own terminal or on their own machine. The binary is self-contained, so you can copy it to another machine with the same OS and architecture.
 
 ```sh
-# Terminal A: Alice's machine. Leave this running.
+# Alice: host a room and leave it running. It prints an `Invite:` token.
 ./bin/you-be-the-ball host -players 2
 
-# Terminal B: Bob's machine. Optional: discover open public rooms on this LAN.
+# Bob: optionally list open public rooms on the LAN, then join with the token.
 ./bin/you-be-the-ball find
-
-# Then join. Replace TOKEN with the full token from `find` or Alice's `Invite:` line.
 ./bin/you-be-the-ball join 'TOKEN'
 ```
 
-Type the following commands into the running processes, in order:
+Then type these commands into the running processes, in order:
 
-| Where | Type | What to look for |
+| Where | Type | Expect |
 | --- | --- | --- |
-| Alice | `status`, then `start` | `online=2/2`, then `Started`. A guest cannot start. |
-| Bob | `inc bob-1`, then `offline` | The receipt is `v2`. Bob stops syncing. |
-| Alice | `inc alice-1` | The host reaches `v3`. |
-| Bob | `online`, then `inc bob-1` | Reconnected; retry gets the original `v2` receipt. |
-| Both | `status` | `version=3 counter=2` on both. Use `quit` to exit. |
+| Alice | `status`, then `start` | `online=2/2`, then `Started`. Only the host can start. |
+| Bob | `inc bob-1`, then `offline` | `committed bob-1 at v2`. Bob stops syncing. |
+| Alice | `inc alice-1` | `committed alice-1 at v3`. |
+| Bob | `online`, then `inc bob-1` | Reconnected. The retry returns the original `v2` receipt. |
+| Both | `status` | `version=3 counter=2` on both. `quit` exits. |
 
-- Reuse the **same guest data directory** when relaunching to keep the authenticated identity and reclaim a locked seat. Reconnections do not extend a room's expiry.
-- Public discovery only lists non-full lobbies. A private host (`host -private`) is not advertised and requires its invite secret. Give the entire private invite only to intended players.
-- If `find` is empty, try the printed invite directly. The default host listens on TCP 42042. Allow that port on your trusted LAN; guest-network isolation can block even direct connections. For a single-machine test pass `-listen /ip4/127.0.0.1/tcp/42042 -mdns=false` to `host`.
-- If the host quits, no one else can write. Restart `host` with the same directory and listen port, then type `online` on guests. An unexpired room is resumed; creation flags do not override its settings. Use a fresh profile for a new room. Never share one profile between live processes.
+- **One machine:** pass `-listen /ip4/127.0.0.1/tcp/42042 -mdns=false` to `host`.
+- **Nothing found:** `find` browses for 8 seconds and lists only public lobbies that are not full. Otherwise paste the host's invite. The host listens on TCP 42042 by default, so allow that port on your LAN.
+- **Private rooms:** `host -private` is not advertised and needs the full invite, which carries a secret. Share it only with intended players.
+- **Host quit:** nobody else can write. Run `host` again with the same profile and port, then type `online` on each guest.
 
-## Where configuration and state live
+## Where game data is stored
 
-The installed CLI uses the current user's home directory, **not the launch directory**. On Windows the root is `%USERPROFILE%\.you-be-the-ball`. Each machine uses its own files:
+Everything the CLI writes goes under `.you-be-the-ball` in your home directory (`%USERPROFILE%\.you-be-the-ball` on Windows). Nothing is written to the project or to the directory you launch from.
 
 ```text
 ~/.you-be-the-ball/
-  config.json          # optional settings, read at startup
-  host/identity.key    # stable host peer identity
-  host/room.json       # room ID, expiry, roster, committed events
-  join/identity.key    # guest identity for reconnecting
+  config.json          # optional defaults
+  host/identity.key    # host peer identity
+  host/room.json       # the game record: room ID, expiry, roster, committed events
+  join/identity.key    # guest identity
   find/identity.key    # LAN browser identity
 ```
 
-Profiles are created on use; the CLI prints the selected directory. Guest game replicas stay in memory and are rebuilt from the host when you rejoin. You still need an invite to join. Do not share the state folder: it contains private keys and can contain private room secrets. To inspect the default host's game log without printing its invite secret, run `jq '.Events' ~/.you-be-the-ball/host/room.json`.
+- **Profiles:** each subcommand uses the folder named after it, created on first use. The CLI prints `Data directory:` at startup. `-profile NAME` uses `~/.you-be-the-ball/NAME/` instead, for a second room or player on one machine. Run only one process per profile.
+- **The game record lives only on the host.** Guests keep their copy in memory and rebuild it from the host when they rejoin.
+- **Keep a profile to keep your place.** The host's folder resumes its room, and saved room settings win over creation flags. A guest's `identity.key` reclaims its seat once the game has started. Delete a profile folder to start fresh.
+- **Keep it private.** The folder holds private keys and can hold a room's invite secret. To read the event log without the secret, run `jq '.Events' ~/.you-be-the-ball/host/room.json`.
+- **Expiry:** a room lasts 72 hours from creation, or less with `host -ttl 10m`. Reconnecting does not extend it. An expired room refuses all operations and its `room.json` is deleted; `identity.key` is kept.
 
-No config file is required. To customize defaults, create `~/.you-be-the-ball/config.json` with just the fields you want, for example:
+To change the defaults, create `~/.you-be-the-ball/config.json` with only the fields you need:
 
 ```json
 {"host_listen":"/ip4/0.0.0.0/tcp/42043", "players":2, "private":true}
 ```
 
-`peer_listen` and `mdns` are also supported. Explicit flags override config; the room's saved settings still win on resume. `-profile colleague-test` selects `~/.you-be-the-ball/colleague-test/`, useful for a separate room on the same laptop. The old `-dir PATH` is an explicit override (relative to the current directory if not absolute); don't pass it to use home storage.
+`peer_listen` and `mdns` are also supported. Flags override the config file.
 
-### Move a room from the old CLI
+`-dir PATH` stores a profile somewhere else; a relative path is resolved against the launch directory. Builds from before the home-directory layout wrote `.p2p-NAME` folders into the launch directory. `migrate PATH/.p2p-NAME` moves one to `~/.you-be-the-ball/NAME`; stop the old process first. It never overwrites an existing profile.
 
-Stop all old host/guest processes (`quit`) **before** moving their directories. From the project root, if you ran the old CLI from `lan/`:
-
-```sh
-./bin/you-be-the-ball migrate lan/.p2p-*
-```
-
-This explicitly moves each named directory, e.g. `lan/.p2p-host` → `~/.you-be-the-ball/host` and `lan/.p2p-colleague-test` → `~/.you-be-the-ball/colleague-test`. It preserves keys, events and expiration; it never merges or overwrites an existing profile. If you kept the old files somewhere else, pass their actual paths. Migration is a same-filesystem move, and startup never adopts data from a random working directory. Resume the old default room with `host`; resume the colleague room with `host -profile colleague-test -listen /ip4/0.0.0.0/tcp/42043` if that was its old port. The wire protocol and discovery name are unchanged, so an existing colleague binary need not upgrade just to connect.
-
-## Where the core ends
+## Packages
 
 | Package | Responsibility |
 | --- | --- |
-| `room` | Serialized admission and start, fixed roster after start, private invites, event ordering, retry receipts, atomic host storage, expiry. |
-| `session` | Versioned request/response stream, bounded frames, paged replay, guest replica. Browsing never takes a seat. The transport supplies authenticated identities. |
-| `lan` | libp2p identities and streams, manual invites and mDNS discovery; `lan/cmd/you-be-the-ball` is the interactive harness. |
-| `example/counter` | The three game hooks: `Initial`, `Decide`, and deterministic `Apply`. Replace these to integrate another game. |
+| `room` | Admission and start, fixed roster after start, private invites, event ordering, retry receipts, atomic host storage, expiry. |
+| `session` | Versioned request/response stream, bounded frames, paged replay, guest replica. Browsing never takes a seat. |
+| `lan` | libp2p identities and streams, invites, mDNS discovery. `lan/cmd/you-be-the-ball` is the CLI. |
+| `example/counter` | The three game hooks: `Initial`, `Decide` and deterministic `Apply`. Replace these to plug in another game. |
 
-Use a fresh command ID for each logical action; retry **the same action** with the same ID. IDs are scoped to the requesting player and room. Distinct players may use the same ID. Clients apply accepted events in sequence and can lag; the guarantee is the same shared state **at the same event version**. Guests poll every half second in the CLI. A broken connection may take up to the stream deadline (20 s) to be noticed. This is not frame-by-frame action-game networking.
+`lan` is a separate module so the core and its offline tests stay free of networking dependencies.
 
-The host stores `room.json` in its data directory; the fixed deadline defaults to 72 hours **from creation**, with shorter TTLs supported (`host -ttl 10m`). Expired rooms refuse all further operations; the running host removes room data and guests discard in-memory replicas. If the host was shut down, its data is purged before hosting from that directory again. The node identity is separate and intentionally survives room expiry. The core cannot erase another player's independent copy.
+## Guarantees and limits
 
-**Prototype limits:** 2–32 players, 4 KiB per game payload, 4,096 events per room including start. The host rewrites a bounded log on each commit; there is no compaction or host migration. There is no internet lobby service, NAT traversal, relay, or anti-cheat. Test the LAN flow before building those layers. `DESIGN.md` describes the intended next stage.
+- **Retries:** use a fresh command ID for each action, and retry the same action with the same ID. IDs are scoped to the player and room.
+- **Consistency:** every replica has the same state at the same event version. Guests can lag; the CLI polls every half second, and a broken connection can take up to 20 seconds to notice. This is not frame-by-frame action networking.
+- **Limits:** 2–32 players, 4 KiB per game payload, 4,096 events per room including the start. There is no host migration, internet lobby, NAT traversal, relay or anti-cheat.
+
+`DESIGN.md` describes the intended next stage.
