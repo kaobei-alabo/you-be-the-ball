@@ -134,19 +134,54 @@ func (s *State) Receipt(peer, id string) (int, bool) {
 // propose. If the command was applied before, it returns that result instead and
 // no entry, so a retry gets its original receipt. Only the host calls Decide.
 func (s *State) Decide(actor, id string, cmd []byte) (Entry, *Result, error) {
-	if seq, ok := s.Receipt(actor, id); ok {
+	return s.Draft().Decide(actor, id, cmd)
+}
+
+// End returns the entry that finishes (KindFinish) or expires (KindExpire) the game.
+func (s *State) End(kind, peer string) Entry {
+	return Entry{Kind: kind, Peer: peer, Based: s.version}
+}
+
+// Draft decides several commands in a row before any of them is agreed on:
+// each is decided against the state the earlier ones will leave. The host uses
+// one per round, so players who move at the same time are agreed on together
+// and none waits for another's move to go round first. A draft never changes
+// the State: only Apply does, when the entries are agreed. If one of them is
+// not applied after all, those decided after it no longer match the version
+// they were based on and Apply reports them Stale, so they are decided again.
+type Draft struct {
+	s       *State
+	phase   Phase
+	version int
+	state   []byte
+	decided map[receipt]bool
+}
+
+// ErrBusy means the answer depends on an entry that is not agreed on yet: ask again.
+var ErrBusy = errors.New("still being decided; retry")
+
+func (s *State) Draft() *Draft {
+	return &Draft{s: s, phase: s.phase, version: s.version, state: s.state}
+}
+
+// Decide is State.Decide against the draft, and adds the entry to it.
+func (d *Draft) Decide(actor, id string, cmd []byte) (Entry, *Result, error) {
+	if seq, ok := d.s.Receipt(actor, id); ok {
 		return Entry{}, &Result{Seq: seq, Repeat: true}, nil
 	}
-	if s.phase != Playing {
+	if d.decided[receipt{actor, id}] || d.phase != d.s.phase {
+		return Entry{}, nil, ErrBusy // the same command, or the end, is in this draft
+	}
+	if d.phase != Playing {
 		return Entry{}, nil, ErrOver
 	}
-	if !s.member(actor) {
+	if !d.s.member(actor) {
 		return Entry{}, nil, errors.New("not a player in this game")
 	}
 	if id == "" || len(id) > maxID || len(cmd) > MaxPayload {
 		return Entry{}, nil, errors.New("invalid command ID or payload size")
 	}
-	body, err := s.game.Decide(bytes.Clone(s.state), actor, bytes.Clone(cmd))
+	body, err := d.s.game.Decide(bytes.Clone(d.state), actor, bytes.Clone(cmd))
 	if err != nil {
 		return Entry{}, nil, err
 	}
@@ -154,15 +189,40 @@ func (s *State) Decide(actor, id string, cmd []byte) (Entry, *Result, error) {
 		return Entry{}, nil, errors.New("event too large")
 	}
 	// Never propose an event that cannot be applied.
-	if _, err = s.game.Apply(bytes.Clone(s.state), bytes.Clone(body)); err != nil {
+	next, err := d.s.game.Apply(bytes.Clone(d.state), bytes.Clone(body))
+	if err != nil {
 		return Entry{}, nil, err
 	}
-	return Entry{Kind: KindGame, Peer: actor, CommandID: id, Body: bytes.Clone(body), Based: s.version}, nil, nil
+	e := Entry{Kind: KindGame, Peer: actor, CommandID: id, Body: bytes.Clone(body), Based: d.version}
+	if d.decided == nil {
+		d.decided = make(map[receipt]bool)
+	}
+	d.decided[receipt{actor, id}] = true
+	d.state, d.version = next, d.version+1
+	if f, ok := d.s.game.(game.Finisher); ok && f.Finished(bytes.Clone(d.state)) {
+		d.phase, d.version = Finished, d.version+1
+	}
+	return e, nil, nil
 }
 
-// End returns the entry that finishes (KindFinish) or expires (KindExpire) the game.
-func (s *State) End(kind, peer string) Entry {
-	return Entry{Kind: kind, Peer: peer, Based: s.version}
+// End adds the entry that finishes or expires the game. An end that already
+// counted is answered with its result; the other kind of end gets ErrOver.
+func (d *Draft) End(kind, peer string) (Entry, *Result, error) {
+	ended := Finished
+	if kind == KindExpire {
+		ended = Expired
+	}
+	switch {
+	case d.phase != d.s.phase:
+		return Entry{}, nil, ErrBusy // an end is in this draft
+	case d.phase == ended:
+		return Entry{}, &Result{Seq: d.version, Repeat: true}, nil
+	case d.phase != Playing:
+		return Entry{}, nil, ErrOver
+	}
+	e := Entry{Kind: kind, Peer: peer, Based: d.version}
+	d.phase, d.version = ended, d.version+1
+	return e, nil, nil
 }
 
 // Apply performs an agreed entry. A rejected entry changes nothing and uses no
