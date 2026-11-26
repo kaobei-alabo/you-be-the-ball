@@ -1,6 +1,6 @@
 # you-be-the-ball
 
-A Go prototype for small, player-hosted game rooms on a LAN. One player creates a room and starts it once everyone is connected. From then on one player at a time is the host: it decides moves, and every player keeps an identical copy of the game in memory. If the host drops out of a game of three or more, another player takes over. The bundled counter is a test game, not part of the library.
+A Go prototype for small, player-hosted game rooms on a LAN. One player creates a room and starts it once everyone is connected. From then on every player can move at any time, and every player keeps an identical copy of the game in memory. One player, the host, only puts the moves into one order: moves made at the same time are agreed on together, and when two conflict under the game's rules, the one that reached the host first wins. If the host drops out of a game of three or more, another player takes over. The bundled counter is a test game, not part of the library.
 
 ## Offline demo
 
@@ -117,8 +117,9 @@ To change the defaults, create `~/.you-be-the-ball/config.json` with only the fi
 ## Guarantees and limits
 
 - **Retries:** use a fresh command ID for each action and retry it with the same ID. A move that failed with `no host reachable` may still have counted; retrying returns its original receipt instead of counting twice. The automatic retries inside one `inc` (or `lan.Player.Submit`) are covered at any move rate. A retry by hand is recognised until that player has made 1,024 further moves; after that the ID counts as a new move. Once the game is over a retry gets `game is over` (`room expired` after expiry). IDs are scoped to the player and room.
-- **Agreement:** a move counts once a majority of the players hold it (with two players: once the host does). There are never two hosts whose moves can count. Every player sees the same state at the same version; a player can lag by a few milliseconds, or by up to about a second after being offline. A move returns once the mover's own copy holds it (or at most a second after it counted).
-- **Hosts:** the creator hosts first. If the host drops out, the remaining players pick a random successor. With two players only the creator can host.
+- **Moving:** every player can move at any time; the host checks every move that has reached it against the game's rules, in arrival order (of two conflicting moves the first counts, the other gets the game's error), and has the players agree on all of them in one round instead of one round each. With 5 ms of simulated network delay each way, 8 players moving at once made about 320 moves per second with one move in flight each (1,100 with four each), against about 90 when the host agreed on one move at a time; a move made alone takes as long as before.
+- **Agreement:** a move counts once a majority of the players hold it (with two players: once the host does). Only one order of moves can count: a host cut off from most of the players cannot commit anything. Every player sees the same state at the same version; a player can lag by a few milliseconds, or by up to about a second after being offline. A move returns once the mover's own copy holds it (or at most a second after it counted).
+- **Hosts:** hosting is a role in agreeing on the order, not a turn: the host's own moves go into the same order as everyone else's. The creator hosts first. If the host drops out, the remaining players pick a random successor. With two players only the creator can host.
 - **Limits:** 2–32 players, 4 KiB per game payload, any number of moves. There is no internet lobby, NAT traversal, relay or anti-cheat. This is not frame-by-frame action networking.
 
 `DESIGN.md` describes the current design and the original proposal.

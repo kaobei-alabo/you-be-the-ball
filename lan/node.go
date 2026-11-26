@@ -97,6 +97,9 @@ func identity(dir string) (crypto.PrivKey, error) {
 	return key, nil
 }
 
+// wrapHost lets tests put a simulated network between players (delay_test.go).
+var wrapHost func(host.Host) host.Host
+
 // Node is this program's libp2p host. It serves the lobby protocol for every
 // Player made from it.
 type Node struct {
@@ -115,6 +118,9 @@ func New(dir, listen string) (*Node, error) {
 	h, err := libp2p.New(libp2p.Identity(key), libp2p.ListenAddrStrings(listen), libp2p.DisableRelay(), libp2p.ConnectionGater(g))
 	if err != nil {
 		return nil, err
+	}
+	if wrapHost != nil {
+		h = wrapHost(h)
 	}
 	n := &Node{h: h, gate: g, rooms: make(map[string]*Player)}
 	h.SetStreamHandler(lobbyProto, n.serve)

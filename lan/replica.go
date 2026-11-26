@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"math/rand/v2"
+	"slices"
 	"time"
 
 	"github.com/hashicorp/go-hclog"
@@ -94,6 +95,10 @@ func (p *Player) begin(setup room.Setup, rejoin bool) error {
 	c.LeaderLeaseTimeout, c.CommitTimeout = t.Lease, t.Commit
 	c.SnapshotInterval, c.SnapshotThreshold, c.TrailingLogs = compaction.interval, compaction.threshold, compaction.trailing
 	c.Logger = hclog.NewNullLogger()
+	// A round's entries reach raft's leader loop together and go out in one
+	// AppendEntries: unbuffered, the first entry often went alone and the rest
+	// waited a whole round trip for the next one.
+	c.BatchApplyCh = true
 	trans := raft.NewNetworkTransportWithLogger(l, 3, 2*time.Second, hclog.NewNullLogger())
 	moves := p.openMoves(setup)
 	p.mu.Lock()
@@ -323,74 +328,194 @@ func (p *Player) notHost(r *raft.Raft) reply {
 	return reply{Retry: true}
 }
 
-// propose is the host's only way to change the game. A failed Apply is not a
-// "no": the entry may still commit, so the caller retries with the same ID and
-// the state's receipts answer the repeat.
-func (p *Player) propose(build func(*room.State) (room.Entry, *room.Result, error)) reply {
+// maxRound caps the requests one round decides; the rest wait for the next.
+const maxRound = 256
+
+// roundTimeout bounds a round's wait for its entries; tests shorten it.
+var roundTimeout = timeout
+
+// proposal is a move or an end waiting for the host's next round.
+type proposal struct {
+	decide func(*room.Draft) (room.Entry, *room.Result, error) // called with p.mu held
+	answer reply
+	done   bool          // answer is set; guarded by p.mu
+	wake   chan struct{} // answered, or this caller serves the next round
+}
+
+// propose is the host's only way to change the game. Every request that has
+// arrived is decided and agreed on in one round, so players who move at the
+// same time wait for one round trip together, not one each. The caller of the
+// oldest waiting request serves the next round; the others are woken with
+// their answer. A failed Apply is not a "no": the entry may still commit, so
+// the caller retries with the same ID and the state's receipts answer the
+// repeat.
+func (p *Player) propose(decide func(*room.Draft) (room.Entry, *room.Result, error)) reply {
+	q := &proposal{decide: decide, wake: make(chan struct{}, 1)}
+	p.mu.Lock()
+	p.queue = append(p.queue, q)
+	if !p.serving {
+		p.serving = true
+		q.wake <- struct{}{}
+	}
+	p.mu.Unlock()
+	for {
+		<-q.wake
+		p.mu.Lock()
+		done := q.done
+		p.mu.Unlock()
+		if done {
+			return q.answer
+		}
+		p.round()
+		p.mu.Lock()
+		if len(p.queue) > 0 {
+			p.queue[0].wake <- struct{}{} // its caller serves the next round
+		} else {
+			p.serving = false
+		}
+		p.mu.Unlock()
+	}
+}
+
+// round decides and agrees on the oldest waiting requests, in arrival order,
+// and answers them.
+func (p *Player) round() {
 	p.proposing.Lock()
 	defer p.proposing.Unlock()
+	p.mu.Lock()
+	qs := slices.Clone(p.queue[:min(len(p.queue), maxRound)])
+	p.queue = slices.Delete(p.queue, 0, len(qs))
+	p.mu.Unlock()
+	answers := p.agree(qs)
+	p.mu.Lock()
+	for i, q := range qs {
+		q.answer, q.done = answers[i], true
+		q.wake <- struct{}{}
+	}
+	p.mu.Unlock()
+}
+
+// agree decides every request against one draft, so each builds on the ones
+// before it, proposes all the entries at once, and waits until each has
+// committed or the deadline passed. The next round's draft then starts from
+// the applied state; after an unknown outcome, only once a Barrier has applied
+// everything already in the log.
+func (p *Player) agree(qs []*proposal) []reply {
+	out := make([]reply, len(qs))
+	fill := func(r reply) []reply {
+		for i := range out {
+			out[i] = r
+		}
+		return out
+	}
 	r := p.replica()
 	if r == nil {
-		return reply{Err: errNotStarted.Error()}
+		return fill(reply{Err: errNotStarted.Error()})
 	}
-	for range 5 {
-		if r.State() != raft.Leader {
-			return p.notHost(r)
+	if r.State() != raft.Leader {
+		return fill(p.notHost(r))
+	}
+	// Apply everything committed before this term before deciding anything.
+	if term := r.CurrentTerm(); p.barrier != term {
+		if wait(r.Barrier(timeout), timeout) != nil {
+			return fill(reply{Retry: true})
 		}
-		// Apply everything committed before this term before deciding anything.
-		if term := r.CurrentTerm(); p.barrier != term {
-			if wait(r.Barrier(timeout), timeout) != nil {
-				return reply{Retry: true}
-			}
-			p.barrier = term
-		}
-		p.mu.Lock()
-		e, done, err := build(p.state)
-		p.mu.Unlock()
-		if err != nil {
-			return reply{Err: err.Error()}
-		}
-		if done != nil {
-			return reply{Seq: done.Seq}
-		}
-		data, err := json.Marshal(e)
-		if err != nil {
-			return reply{Err: err.Error()}
-		}
-		f := r.Apply(data, timeout)
-		if wait(f, timeout) != nil {
-			return reply{Retry: true}
-		}
-		res, _ := f.Response().(room.Result)
+		p.barrier = term
+	}
+	var entries [][]byte
+	var which []int // the request of each entry
+	p.mu.Lock()
+	d := p.state.Draft()
+	for i, q := range qs {
+		e, done, err := q.decide(d)
 		switch {
-		case res.Stale:
-			continue
-		case res.Err != "":
-			return reply{Err: res.Err}
+		case errors.Is(err, room.ErrBusy):
+			out[i] = reply{Retry: true}
+		case err != nil:
+			out[i] = reply{Err: err.Error()}
+		case done != nil:
+			out[i] = reply{Seq: done.Seq}
+		default:
+			data, err := json.Marshal(e)
+			if err != nil {
+				out[i] = reply{Err: err.Error()}
+				continue
+			}
+			entries, which = append(entries, data), append(which, i)
 		}
-		return reply{Seq: res.Seq}
 	}
-	return reply{Retry: true}
+	if len(entries) > 0 {
+		p.rounds, p.proposed = p.rounds+1, p.proposed+len(entries)
+	}
+	p.mu.Unlock()
+	deadline := time.Now().Add(roundTimeout)
+	fs := make([]raft.ApplyFuture, 0, len(entries))
+	for _, data := range entries {
+		left := time.Until(deadline)
+		if left <= 0 { // 0 would mean no time limit
+			break
+		}
+		fs = append(fs, r.Apply(data, left))
+	}
+	errs := settle(fs, time.Until(deadline))
+	for k, i := range which {
+		if k >= len(fs) || errs[k] != nil {
+			// The outcome is unknown: the entry may still be applied. Drafted
+			// without it, the next round's entries would take its versions.
+			out[i] = reply{Retry: true}
+			p.barrier = 0
+			continue
+		}
+		res, _ := fs[k].Response().(room.Result)
+		switch {
+		case res.Stale: // an entry before it did not count: decided again next round
+			out[i] = reply{Retry: true}
+		case res.Err != "":
+			out[i] = reply{Err: res.Err}
+		default:
+			out[i] = reply{Seq: res.Seq}
+		}
+	}
+	return out
+}
+
+// settle waits for the futures, in order, for at most d in all: a future can
+// block forever on a node shutting down. Those still open then get errTimeout.
+func settle(fs []raft.ApplyFuture, d time.Duration) []error {
+	ch := make(chan error, len(fs))
+	go func() {
+		for _, f := range fs {
+			ch <- f.Error()
+		}
+	}()
+	errs := make([]error, len(fs))
+	t := time.NewTimer(d)
+	defer t.Stop()
+	for i := range errs {
+		select {
+		case errs[i] = <-ch:
+		case <-t.C:
+			for ; i < len(errs); i++ {
+				errs[i] = errTimeout
+			}
+			return errs
+		}
+	}
+	return errs
 }
 
 func (p *Player) decide(actor, id string, cmd []byte) reply {
-	return p.propose(func(s *room.State) (room.Entry, *room.Result, error) {
-		if !time.Now().Before(s.Info().Expires) {
+	return p.propose(func(d *room.Draft) (room.Entry, *room.Result, error) {
+		if !time.Now().Before(p.expires) {
 			return room.Entry{}, nil, room.ErrExpired
 		}
-		return s.Decide(actor, id, cmd)
+		return d.Decide(actor, id, cmd)
 	})
 }
 
 func (p *Player) end(kind string) reply {
-	return p.propose(func(s *room.State) (room.Entry, *room.Result, error) {
-		switch info := s.Info(); {
-		case info.Phase == room.Playing:
-			return s.End(kind, p.n.ID().String()), nil, nil
-		case kind == room.KindFinish && info.Phase == room.Finished, kind == room.KindExpire && info.Phase == room.Expired:
-			return room.Entry{}, &room.Result{Seq: info.Version}, nil // a retry of an end that counted
-		}
-		return room.Entry{}, nil, room.ErrOver
+	return p.propose(func(d *room.Draft) (room.Entry, *room.Result, error) {
+		return d.End(kind, p.n.ID().String())
 	})
 }
 
