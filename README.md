@@ -43,7 +43,7 @@ Then type these commands into the running processes, in order:
 | Bob | `inc bob-1` | `committed bob-1 at v2` again: the retry returns the original receipt. |
 | Alice | `online`, then `status` | `* host is now …`, then `version=3 counter=2`, like the others. |
 | Bob | `invite` | `Invite: …`, a token for a player whose program restarted (see Quitting). |
-| New host | `finish` | `Finished`. Every player prints `* game finished; record saved to …`. `quit` exits. |
+| New host | `finish` | `Finished`. Every player prints `* game finished; record saved to …`. `quit` exits; then `replay` lists the game and `replay -profile host ROOM_ID` plays it back (see Replays). |
 
 With two players only the creator hosts. If the guest goes offline, the host keeps playing and the guest catches up when it returns. If the host goes offline, the guest's moves fail and `status` shows `paused` until the host is back. If the host quits, the game ends for both: each records it as `interrupted`, and the guest prints `* room closed` (a guest that is offline at that moment stays paused until it quits too). A guest whose program restarted can rejoin (see Quitting); the creator cannot: once its program has closed, the game is over.
 
@@ -60,16 +60,32 @@ By default, everything the CLI writes goes under `.you-be-the-ball` in your home
 ~/.you-be-the-ball/
   config.json                 # optional defaults
   host/identity.key           # this player's peer identity
-  host/games/<roomID>.json    # record of a game this player was in
+  host/games/<roomID>.json    # result of a game this player was in
+  host/games/<roomID>.moves   # its moves, for replays
   join/identity.key
   find/identity.key           # LAN browser identity
 ```
 
-- **Profiles:** each subcommand uses the folder named after it, created on first use. The CLI prints `Data directory:` at startup. `-profile NAME` uses `~/.you-be-the-ball/NAME/` instead, for a second room or player on one machine. Run only one process per profile: in a started game a second one takes the seat from the first, which stops counting and shows `paused`, while the second may fail to rejoin. If another player is offline then, the game pauses for everyone until that player is back. To recover, stop both and rejoin once.
-- **Nothing is written while playing.** Every player keeps the game in memory, and drops its moves from memory when the game ends. Each player writes `games/<roomID>.json` in its own profile once, when the game finishes or expires, or with status `interrupted` when that player quits mid-game.
-- **Reading a record:** a record holds the result only: `Status`, `Version` (the number of steps: the start, each move, and the finish or expiry if there was one), `Players` and `Result`, the game's final state or what the game keeps of it, such as the score. `jq '{Status, Version, Players}' ~/.you-be-the-ball/host/games/*.json` shows the outcome and `jq -r '.Result | @base64d'` the result. Moves are not saved, and a record holds no invite secret.
+- **Profiles:** `host`, `join` and `find` each use the folder named after them, created on first use. The CLI prints `Data directory:` at startup. `-profile NAME` uses `~/.you-be-the-ball/NAME/` instead, for a second room or player on one machine. Run only one process per profile: in a started game a second one takes the seat from the first, which stops counting and shows `paused`, while the second may fail to rejoin. If another player is offline then, the game pauses for everyone until that player is back. To recover, stop both and rejoin once.
+- **The result:** every player writes `games/<roomID>.json` in its own profile once, when the game finishes or expires, or with status `interrupted` when that player quits mid-game. It holds `Status`, `Version` (the number of steps: the start, each move, and the finish or expiry if there was one), `Players` and `Result`, the game's final state or what the game keeps of it, such as the score. `jq '{Status, Version, Players}' ~/.you-be-the-ball/host/games/*.json` shows the outcome and `jq -r '.Result | @base64d'` the result. It is kept until you delete it.
+- **The moves:** while playing, every player appends each move to `games/<roomID>.moves`: its version, the mover's peer ID, the command ID and the game's event. Treat the file as the game's private history. Writing is buffered, so a crash loses at most about the last second. Neither file holds an invite secret.
+- **How long moves are kept:** 3 days after the file was last written; it is then removed the next time the program runs for that profile. `"keep_moves":"24h"` in `config.json` changes that (Go durations: `h`, `m`, `s`; no `d`). `"0"` writes none and removes the existing ones, except of a game that may still be going. `-keep-moves` on `host` or `join` overrides it for that run only.
+- **Gaps:** a player that was not running, or was offline for more than about 1,024 moves, is brought up to date without the moves it missed, so its own file lacks them. Players who stayed connected have them all. A replay stops at a gap, or at a missing end, and says so.
+- **Replays:** `replay` lists the games with moves, newest first, with when they were last played and their status; `replay ROOM_ID` (or a `.moves` file) plays one back; the count excludes the finish or expiry. Without `-profile` or `-dir` it looks in every profile.
+
+  ```text
+  $ ./bin/you-be-the-ball replay -profile alice 2e7329a529397f75b85cba0a4f426881
+  Room 2e7329a529397f75b85cba0a4f426881, players x6Fw2Zwr PY2K6YGD dLSbgmcD
+  v2 dLSbgmcD b1 counter=1
+  v3 PY2K6YGD c1 counter=2
+  v4 x6Fw2Zwr a1 counter=3
+  v5 PY2K6YGD c2 counter=4
+  v6 dLSbgmcD b2 counter=5
+  v7 finish
+  5 moves replayed
+  ```
 - **Keep `identity.key` private.** It is the player's private key and stays across games. Delete a profile folder to start fresh.
-- **Expiry:** a room lasts 72 hours from creation, or less with `host -ttl 10m`. After that no moves are accepted and the game is recorded as `expired`. Records are kept until you delete them.
+- **Expiry:** a room lasts 72 hours from creation, or less with `host -ttl 10m`. After that no moves are accepted and the game is recorded as `expired`.
 
 To change the defaults, create `~/.you-be-the-ball/config.json` with only the fields you need:
 
@@ -77,7 +93,7 @@ To change the defaults, create `~/.you-be-the-ball/config.json` with only the fi
 {"host_listen":"/ip4/0.0.0.0/tcp/42043", "players":2, "private":true}
 ```
 
-`peer_listen` and `mdns` are also supported. Flags override the config file.
+`peer_listen`, `mdns` and `keep_moves` are also supported. Flags override the config file.
 
 `-dir PATH` uses that folder instead of a profile. To keep the identity in a `.p2p-NAME` folder from an older build, stop that process and run `migrate PATH/.p2p-NAME` before you first use profile `NAME`. It moves the folder (same filesystem only) to `~/.you-be-the-ball/NAME` and never overwrites an existing profile. An old `room.json` in it is not used.
 
@@ -91,7 +107,7 @@ To change the defaults, create `~/.you-be-the-ball/config.json` with only the fi
 | Package | Responsibility |
 | --- | --- |
 | `game` | The `Game` interface: `Initial`, `Decide` and deterministic `Apply`; optionally `Finisher` (the game ends itself) and `Resulter` (what a record keeps, such as the score). `game/counter` is the test game. To add a game, implement `game.Game` and point `play` in `cmd/you-be-the-ball/repl.go` at it. |
-| `room` | The lobby (admission, private invites, start), the started game's state and its pure `Apply`, retry receipts, expiry, records. No network IO. |
+| `room` | The lobby (admission, private invites, start), the started game's state and its pure `Apply`, retry receipts, expiry, records, moves files and their replay. No network IO. |
 | `lan` | libp2p identities, invites, mDNS discovery, the lobby protocol, and Raft replication (hashicorp/raft) of the game after the start. |
 | `internal/home` | Profiles and `config.json` under `~/.you-be-the-ball`. |
 | `cmd/you-be-the-ball` | The CLI. `cmd/demo` is the offline demo. |
@@ -100,7 +116,7 @@ To change the defaults, create `~/.you-be-the-ball/config.json` with only the fi
 
 ## Guarantees and limits
 
-- **Retries:** use a fresh command ID for each action and retry it with the same ID. A move that failed with `no host reachable` may still have counted; a retry returns its original receipt instead of counting twice if it is among that player's last 1,024 moves. An older ID counts as a new move, so a player should not have 1,024 other moves commit while one is still being retried. Once the game is over a retry gets `game is over` (`room expired` after expiry). IDs are scoped to the player and room.
+- **Retries:** use a fresh command ID for each action and retry it with the same ID. A move that failed with `no host reachable` may still have counted; retrying returns its original receipt instead of counting twice. The automatic retries inside one `inc` (or `lan.Player.Submit`) are covered at any move rate. A retry by hand is recognised until that player has made 1,024 further moves; after that the ID counts as a new move. Once the game is over a retry gets `game is over` (`room expired` after expiry). IDs are scoped to the player and room.
 - **Agreement:** a move counts once a majority of the players hold it (with two players: once the host does). There are never two hosts whose moves can count. Every player sees the same state at the same version; a player can lag by a few milliseconds, or by up to about a second after being offline. A move returns once the mover's own copy holds it (or at most a second after it counted).
 - **Hosts:** the creator hosts first. If the host drops out, the remaining players pick a random successor. With two players only the creator can host.
 - **Limits:** 2–32 players, 4 KiB per game payload, any number of moves. There is no internet lobby, NAT traversal, relay or anti-cheat. This is not frame-by-frame action networking.

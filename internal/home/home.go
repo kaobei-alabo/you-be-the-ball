@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 const basename = ".you-be-the-ball"
@@ -34,17 +35,31 @@ func ProfileDir(root, name string) (string, error) {
 }
 
 type Config struct {
-	HostListen string `json:"host_listen"`
-	PeerListen string `json:"peer_listen"`
-	Players    int    `json:"players"`
-	MDNS       bool   `json:"mdns"`
-	Private    bool   `json:"private"`
+	HostListen string   `json:"host_listen"`
+	PeerListen string   `json:"peer_listen"`
+	Players    int      `json:"players"`
+	MDNS       bool     `json:"mdns"`
+	Private    bool     `json:"private"`
+	KeepMoves  Duration `json:"keep_moves"` // how long moves are kept for replays; 0 keeps none
+}
+
+// Duration is written as in Go, such as "72h".
+type Duration time.Duration
+
+func (d *Duration) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return errors.New(`a duration must be a string such as "72h"`)
+	}
+	v, err := time.ParseDuration(s)
+	*d = Duration(v)
+	return err
 }
 
 // LoadConfig overlays an optional config.json on the defaults. Merely looking up
 // the path (including requesting CLI help) never creates files or a peer identity.
 func LoadConfig(root string) (Config, error) {
-	c := Config{HostListen: "/ip4/0.0.0.0/tcp/42042", PeerListen: "/ip4/0.0.0.0/tcp/0", Players: 2, MDNS: true}
+	c := Config{HostListen: "/ip4/0.0.0.0/tcp/42042", PeerListen: "/ip4/0.0.0.0/tcp/0", Players: 2, MDNS: true, KeepMoves: Duration(72 * time.Hour)}
 	path := filepath.Join(root, "config.json")
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -68,6 +83,9 @@ func LoadConfig(root string) (Config, error) {
 	}
 	if c.Players < 2 || c.Players > 32 || c.HostListen == "" || c.PeerListen == "" {
 		return Config{}, fmt.Errorf("%s: players must be 2..32 and listen addresses must not be empty", path)
+	}
+	if c.KeepMoves < 0 {
+		return Config{}, fmt.Errorf("%s: keep_moves must not be negative", path)
 	}
 	return c, nil
 }

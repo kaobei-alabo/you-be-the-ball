@@ -13,6 +13,7 @@ import (
 
 	"github.com/kaobei-alabo/you-be-the-ball/internal/home"
 	"github.com/kaobei-alabo/you-be-the-ball/lan"
+	"github.com/kaobei-alabo/you-be-the-ball/room"
 )
 
 func fakeHome(t *testing.T) string {
@@ -92,7 +93,22 @@ func TestHomeConfigAndFlagPrecedence(t *testing.T) {
 	if err != nil || peer.listen != "/ip4/0.0.0.0/tcp/0" {
 		t.Fatal(peer, err)
 	}
-	for _, invalid := range []string{`{`, `{"typo":true}`, `{} {}`, `null`, `{"players":1}`} {
+	if h.keep != 72*time.Hour {
+		t.Fatal("default keep-moves", h.keep)
+	}
+	if err := os.WriteFile(path, []byte(`{"keep_moves":"1h30m"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if h, err = parseOptions(io.Discard, root, "host", nil); err != nil || h.keep != 90*time.Minute {
+		t.Fatal(h.keep, err)
+	}
+	if h, err = parseOptions(io.Discard, root, "join", []string{"-keep-moves", "0", "invite"}); err != nil || h.keep != 0 {
+		t.Fatal(h.keep, err)
+	}
+	if _, err = parseOptions(io.Discard, root, "host", []string{"-keep-moves", "-1h"}); err == nil {
+		t.Fatal("accepted a negative -keep-moves")
+	}
+	for _, invalid := range []string{`{`, `{"typo":true}`, `{} {}`, `null`, `{"players":1}`, `{"keep_moves":"3 days"}`, `{"keep_moves":72}`, `{"keep_moves":"-1h"}`} {
 		if err := os.WriteFile(path, []byte(invalid), 0600); err != nil {
 			t.Fatal(err)
 		}
@@ -353,14 +369,38 @@ func TestThreePlayersHostChange(t *testing.T) {
 		if n := c.count("* game started"); n != 1 {
 			t.Fatalf("%s: %d start notices", c.name, n)
 		}
+		// Every player replays the whole game.
+		id := strings.TrimSuffix(filepath.Base(rec), ".json")
+		if got := cmdOut(t, "replay", "-profile", c.name); !strings.HasPrefix(got, id+"  ") || !strings.HasSuffix(got, "  finished\n") {
+			t.Fatalf("%s: replay list %q", c.name, got)
+		}
+		got := strings.Split(cmdOut(t, "replay", "-profile", c.name, id), "\n")
+		r, err := room.ReadRecord(rec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 7 || !strings.HasPrefix(got[0], "Room "+id+", players ") || !strings.HasPrefix(got[1], "v2 ") || !strings.HasSuffix(got[1], " b1 counter=1") ||
+			!strings.HasSuffix(got[3], " b2 counter="+string(r.Result)) || got[4] != "v5 finish" || got[5] != "3 moves replayed" {
+			t.Fatalf("%s: replay %q", c.name, got)
+		}
 	}
+}
+
+// cmdOut runs a command that exits by itself and returns what it printed.
+func cmdOut(t *testing.T, args ...string) string {
+	t.Helper()
+	var b strings.Builder
+	if err := run(args, nil, &b, io.Discard); err != nil {
+		t.Fatal(args, err)
+	}
+	return b.String()
 }
 
 // With two players only the creator hosts: the guest never takes over.
 func TestTwoPlayersHostStaysInCharge(t *testing.T) {
-	fakeHome(t)
+	root := fakeHome(t)
 	fastCLI(t)
-	alice := launch(t, "alice", "host", "-players", "2")
+	alice := launch(t, "alice", "host", "-players", "2", "-keep-moves", "0")
 	bob := launch(t, "bob", "join", alice.invite)
 	alice.until("status", "online=2/2")
 	if got := alice.do("start"); got != "Started" {
@@ -387,6 +427,11 @@ func TestTwoPlayersHostStaysInCharge(t *testing.T) {
 	fmt.Fprintln(alice.in, "quit")
 	bob.notice(m, "* room closed")
 	bob.until("status", "phase=closed")
+	for name, want := range map[string]int{"alice": 0, "bob": 1} { // alice keeps no moves
+		if files, _ := filepath.Glob(filepath.Join(root, name, "games", "*.moves")); len(files) != want {
+			t.Fatal(name, files)
+		}
+	}
 }
 
 func TestGuestOfAClosedLobby(t *testing.T) {
@@ -461,5 +506,92 @@ func TestPlayerRejoinsWithTheSameProfile(t *testing.T) {
 	alice.until("status", "version=5 counter=4")
 	if carol.count("Rejoined at v4") != 1 || carol.count("* game started") != 0 {
 		t.Fatal("wrong rejoin output")
+	}
+}
+
+// moves writes a moves file for room id in profile, n moves long, optionally
+// with a result; it returns the file.
+func moves(t *testing.T, root, profile, id string, n int, result bool) string {
+	t.Helper()
+	dir := filepath.Join(root, profile)
+	now := time.Now()
+	setup := room.Setup{ID: id, Players: 2, Created: now, Expires: now.Add(time.Hour), Roster: []room.Member{{Peer: "peer-aaaaaaaa"}, {Peer: "peer-bbbbbbbb"}}}
+	m, err := room.OpenMoves(dir, setup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range n {
+		m.Add(room.Move{Seq: i + 2, Peer: "peer-bbbbbbbb", ID: fmt.Sprint("b", i), Body: []byte("+1")})
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if result {
+		if _, err := room.WriteRecord(dir, room.Record{ID: id, Status: "finished"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return filepath.Join(dir, "games", id+".moves")
+}
+
+func TestReplayListsPlaysAndPurges(t *testing.T) {
+	root := fakeHome(t)
+	if got := cmdOut(t, "replay"); got != "No replays in "+root+".\n" {
+		t.Fatal(got)
+	}
+	old := moves(t, root, "host", "old", 2, true)
+	moves(t, root, "join", "kept", 2, false)
+	both := moves(t, root, "host", "both", 1, true)
+	moves(t, root, "join", "both", 1, true)
+	day := 24 * time.Hour
+	for f, age := range map[string]time.Duration{old: 4 * day, both: day} {
+		if err := os.Chtimes(f, time.Now().Add(-age), time.Now().Add(-age)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// "old" is past the 3 days: gone, its result kept. Newest first.
+	lines := strings.Split(strings.TrimSpace(cmdOut(t, "replay")), "\n")
+	if len(lines) != 3 || !strings.HasPrefix(lines[0], "kept  ") && !strings.HasPrefix(lines[0], "both  ") || !strings.HasSuffix(lines[2], "  finished  (host)") || !strings.Contains(strings.Join(lines, "\n"), "  no result  (join)") {
+		t.Fatalf("%q", lines)
+	}
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Fatal("not purged:", err)
+	}
+	if _, err := os.Stat(strings.TrimSuffix(old, ".moves") + ".json"); err != nil {
+		t.Fatal("the result was purged:", err)
+	}
+	if got := cmdOut(t, "replay", "-profile", "join"); strings.Contains(got, "(join)") || strings.Count(got, "\n") != 2 {
+		t.Fatalf("%q", got)
+	}
+	want := "Room kept, players aaaaaaaa bbbbbbbb\nv2 bbbbbbbb b0 counter=1\nv3 bbbbbbbb b1 counter=2\n2 moves replayed\n"
+	if got := cmdOut(t, "replay", "kept"); got != want {
+		t.Fatalf("%q", got)
+	}
+	if got := cmdOut(t, "replay", filepath.Join(root, "join", "games", "kept.moves")); got != want {
+		t.Fatalf("%q", got)
+	}
+	for args, msg := range map[string]string{
+		"replay both":               "room both is in profiles host, join: choose one with -profile",
+		"replay -profile host kept": `no replay of room kept; "replay" lists them`,
+	} {
+		if err := run(strings.Fields(args), nil, io.Discard, io.Discard); err == nil || err.Error() != msg {
+			t.Fatal(args, err)
+		}
+	}
+	if err := run([]string{"replay", "-dir", ""}, nil, io.Discard, io.Discard); err == nil {
+		t.Fatal("an empty -dir listed every profile")
+	}
+
+	// A gap: what comes before it is printed, then the error.
+	f, err := os.OpenFile(filepath.Join(root, "join", "games", "kept.moves"), os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.WriteString(`{"Seq":9,"Peer":"peer-aaaaaaaa","ID":"a","Body":"KzE="}` + "\n")
+	f.Close()
+	var b strings.Builder
+	err = run([]string{"replay", "-profile", "join", "kept"}, nil, &b, io.Discard)
+	if err == nil || !strings.HasPrefix(err.Error(), "moves 4 to 8 are missing") || b.String() != strings.TrimSuffix(want, "2 moves replayed\n") {
+		t.Fatalf("%q %v", b.String(), err)
 	}
 }

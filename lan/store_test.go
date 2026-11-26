@@ -1,6 +1,7 @@
 package lan
 
 import (
+	"io"
 	"testing"
 
 	"github.com/hashicorp/raft"
@@ -35,4 +36,42 @@ func TestStoreDeleteRangeKeepsItsBounds(t *testing.T) {
 	check(0, 0, 0)
 	_ = s.StoreLog(&raft.Log{Index: 500})
 	check(500, 500, 1)
+}
+
+// A snapshot being written is not offered: the host would send half of it.
+func TestSnapshotIsOfferedOnlyOnceWhole(t *testing.T) {
+	s := &snapshots{}
+	k, _ := s.Create(1, 10, 2, raft.Configuration{}, 1, nil)
+	k.Write([]byte("hal"))
+	if l, _ := s.List(); len(l) != 0 {
+		t.Fatal("listed while written:", l)
+	}
+	k.Write([]byte("f"))
+	k.Close()
+	next, _ := s.Create(1, 20, 2, raft.Configuration{}, 1, nil)
+	next.Write([]byte("partial"))
+	l, _ := s.List()
+	meta, r, err := s.Open(k.ID())
+	if len(l) != 1 || l[0].ID != k.ID() || err != nil || meta.Size != 4 {
+		t.Fatal(l, meta, err)
+	}
+	if b, _ := io.ReadAll(r); string(b) != "half" {
+		t.Fatalf("%q", b)
+	}
+	if _, _, err := s.Open(next.ID()); err == nil {
+		t.Fatal("opened an unfinished snapshot")
+	}
+	// A snapshot that finishes after a newer one must not replace it.
+	late, _ := s.Create(1, 15, 2, raft.Configuration{}, 1, nil)
+	next.Close()
+	late.Write([]byte("older"))
+	late.Close()
+	if l, _ := s.List(); len(l) != 1 || l[0].Index != 20 {
+		t.Fatal("an older snapshot replaced a newer one:", l)
+	}
+	if _, r, err := s.Open(next.ID()); err != nil {
+		t.Fatal(err)
+	} else if b, _ := io.ReadAll(r); string(b) != "partial" {
+		t.Fatalf("%q", b)
+	}
 }

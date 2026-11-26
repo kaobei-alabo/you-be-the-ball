@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"sync"
@@ -39,11 +40,15 @@ func heap() string {
 }
 
 // TestLongGame plays long games with the production compaction settings. It
-// takes about 35 s, so it runs only with LONG_GAME=1.
+// takes about 35 s, so it runs only with LONG_GAME=1. The players keep their
+// moves, as by default, unless KEEP_MOVES=0.
 func TestLongGame(t *testing.T) {
 	if os.Getenv("LONG_GAME") == "" {
 		t.Skip("set LONG_GAME=1")
 	}
+	old := keepMoves
+	keepMoves = os.Getenv("KEEP_MOVES") != "0"
+	t.Cleanup(func() { keepMoves = old })
 	for _, c := range []struct {
 		moves, size int
 		rejoin      bool
@@ -101,7 +106,7 @@ func long(t *testing.T, total, size int, rejoin bool) {
 		ps[2].logs.logs = nil // gone with the crashed program, not kept by the test
 		ps[2].logs.mu.Unlock()
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		c, err := Join(ctx, newNode(t, dirs[2]), theGame, inv, Options{Dir: t.TempDir()})
+		c, err := Join(ctx, newNode(t, dirs[2]), theGame, inv, Options{Dir: t.TempDir(), KeepMoves: keepMoves})
 		cancel()
 		if err != nil {
 			t.Fatal(err)
@@ -127,4 +132,7 @@ func long(t *testing.T, total, size int, rejoin bool) {
 	}
 	t.Logf("%d moves of %d B in %v: %.0f moves/s; heap in use: start %s, middle %s, end %s",
 		total, size, d.Round(time.Millisecond), float64(total)/d.Seconds(), start, middle, heap())
+	if fi, err := os.Stat(filepath.Join(ps[0].o.Dir, "games", ps[0].id+".moves")); err == nil {
+		t.Logf("moves file: %.1f MiB", float64(fi.Size())/(1<<20))
+	}
 }

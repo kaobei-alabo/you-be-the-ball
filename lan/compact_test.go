@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -175,6 +176,15 @@ func TestPlayerOfflineAtTheEndLearnsTheResult(t *testing.T) {
 	waitFor(t, "the offline player learns the end", func() bool { return off.Status().Phase == room.Finished })
 	waitFor(t, "an empty log on it too", func() bool { _, _, n := span(off); return n == 0 })
 	records(t, ps, "12")
+	// Its moves file stops before the end, and its replay says so.
+	if ms, _, err := replayOf(off); err == nil || !strings.Contains(err.Error(), "are missing") || len(ms) < 6 {
+		t.Fatal("the missing end was not reported:", len(ms), err)
+	}
+	for _, p := range without(ps, off) {
+		if ms, _, err := replayOf(p); err != nil || len(ms) != 13 {
+			t.Fatal(len(ms), err)
+		}
+	}
 	for _, p := range ps {
 		if v := p.Status().Version; v != 14 {
 			t.Fatal("version", v)

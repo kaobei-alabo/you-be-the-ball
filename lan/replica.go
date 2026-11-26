@@ -95,13 +95,15 @@ func (p *Player) begin(setup room.Setup, rejoin bool) error {
 	c.SnapshotInterval, c.SnapshotThreshold, c.TrailingLogs = compaction.interval, compaction.threshold, compaction.trailing
 	c.Logger = hclog.NewNullLogger()
 	trans := raft.NewNetworkTransportWithLogger(l, 3, 2*time.Second, hclog.NewNullLogger())
+	moves := p.openMoves(setup)
 	p.mu.Lock()
-	p.state, p.roster, p.expires = st, roster, setup.Expires
+	p.state, p.roster, p.expires, p.moves = st, roster, setup.Expires, moves
 	p.mu.Unlock()
 	s := newStore()
-	r, err := raft.NewRaft(c, (*fsm)(p), s, s, raft.NewInmemSnapshotStore(), trans)
+	r, err := raft.NewRaft(c, (*fsm)(p), s, s, &snapshots{}, trans)
 	if err != nil {
 		l.Close()
+		p.closeMoves()
 		return err
 	}
 	ch := make(chan raft.Observation, 64)
@@ -117,6 +119,7 @@ func (p *Player) begin(setup room.Setup, rejoin bool) error {
 	p.mu.Unlock()
 	if closed {
 		p.shutdown(r, l, obs, ch)
+		p.closeMoves()
 		return errClosed
 	}
 	go func() {
@@ -125,8 +128,79 @@ func (p *Player) begin(setup room.Setup, rejoin bool) error {
 		}
 	}()
 	go p.expire(setup.Expires)
+	if moves != nil {
+		go p.flushMoves()
+	}
 	p.signal()
 	return nil
+}
+
+// openMoves starts or continues this player's moves file, if it keeps one. A
+// replay is a convenience: without the file the game goes on all the same.
+func (p *Player) openMoves(s room.Setup) *room.Moves {
+	if !p.o.KeepMoves || p.o.Dir == "" {
+		return nil
+	}
+	m, err := room.OpenMoves(p.o.Dir, s)
+	if err != nil {
+		return nil
+	}
+	return m
+}
+
+// flushMoves hands the buffered moves to the OS every second, so a crash
+// loses at most about a second of the replay.
+func (p *Player) flushMoves() {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-p.done:
+			return
+		case <-t.C:
+		}
+		p.mu.Lock()
+		m := p.moves
+		if m != nil {
+			_ = m.Flush()
+		}
+		p.mu.Unlock()
+		if m == nil {
+			return
+		}
+	}
+}
+
+// closeMoves closes the moves file once, with its one fsync outside the lock.
+func (p *Player) closeMoves() {
+	p.mu.Lock()
+	m := p.moves
+	p.moves = nil
+	p.mu.Unlock()
+	if m != nil {
+		_ = m.Close()
+	}
+}
+
+// keep appends what an applied entry did to the moves file; the caller holds p.mu.
+func (p *Player) keep(e room.Entry, res room.Result, over bool) {
+	if p.moves == nil || res.Seq == 0 || res.Repeat || res.Stale || res.Err != "" {
+		return
+	}
+	if e.Kind != room.KindGame {
+		// Nothing checks who proposed an end: log only a player's ID, so a
+		// hostile host cannot write a line too long to replay.
+		who := e.Peer
+		if id, err := peer.Decode(who); err != nil || !p.roster[id] {
+			who = ""
+		}
+		p.moves.Add(room.Move{Seq: res.Seq, Kind: e.Kind, Peer: who})
+		return
+	}
+	p.moves.Add(room.Move{Seq: res.Seq, Peer: e.Peer, ID: e.CommandID, Body: e.Body})
+	if over { // the game ended itself (game.Finisher)
+		p.moves.Add(room.Move{Seq: res.Seq + 1, Kind: room.KindFinish})
+	}
 }
 
 func (p *Player) shutdown(r *raft.Raft, l *layer, obs *raft.Observer, ch chan raft.Observation) {
@@ -151,6 +225,7 @@ func (f *fsm) Apply(l *raft.Log) any {
 	was := p.state.Info().Phase
 	res := p.state.Apply(e)
 	over := p.state.Info().Phase != room.Playing
+	p.keep(e, res, over)
 	r := p.raft
 	p.changed()
 	p.mu.Unlock()
@@ -221,7 +296,9 @@ func (f *fsm) Restore(rc io.ReadCloser) error {
 }
 
 // save writes the record once: when the game ends, or "interrupted" on Close.
+// The moves file is complete then and is closed.
 func (p *Player) save() {
+	p.closeMoves()
 	p.mu.Lock()
 	if p.saved || p.state == nil || p.o.Dir == "" {
 		p.mu.Unlock()

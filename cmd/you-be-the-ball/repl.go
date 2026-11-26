@@ -22,8 +22,11 @@ var play = struct {
 	game.Game
 	word  string // REPL command that makes a move
 	move  []byte
-	label string // printed before the state in "status"
+	label string // printed before the state in "status" and "replay"
 }{counter.Game{}, "inc", []byte("inc"), "counter"}
+
+// view renders a state as "status" and "replay" print it.
+func view(state []byte) string { return play.label + "=" + string(state) }
 
 // out serializes the REPL's answers and the notices.
 type out struct {
@@ -126,7 +129,7 @@ func status(p *lan.Player, me string) string {
 	case p.State() == nil:
 		return "phase=" + string(s.Phase) // the lobby closed
 	}
-	line := fmt.Sprintf("phase=%s host=%s version=%d %s=%s expires=%s", s.Phase, short(s.Host, me), s.Version, play.label, p.State(), expires)
+	line := fmt.Sprintf("phase=%s host=%s version=%d %s expires=%s", s.Phase, short(s.Host, me), s.Version, view(p.State()), expires)
 	if s.Paused {
 		line += " paused"
 	}

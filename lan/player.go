@@ -17,10 +17,12 @@ import (
 // timeout equals Heartbeat.
 type Timing struct{ Heartbeat, Lease, Commit time.Duration }
 
-// Options: records go to Dir/games; an empty Dir writes no record.
+// Options: records go to Dir/games; an empty Dir writes nothing. KeepMoves also
+// appends every move this player applies to Dir/games/<roomID>.moves for replays.
 type Options struct {
-	Dir    string
-	Timing Timing
+	Dir       string
+	KeepMoves bool
+	Timing    Timing
 }
 
 // Phases a Player has besides those of a started game.
@@ -82,6 +84,9 @@ type Player struct {
 	closed  bool
 	saved   bool
 	record  string
+	moves   *room.Moves // nil unless kept, and once closed
+
+	window window // bounds this player's concurrent Submits
 
 	seats     sync.Mutex // orders lobby broadcasts
 	proposing sync.Mutex
@@ -186,6 +191,7 @@ func (p *Player) stop(graceful bool) {
 			p.save()
 		}
 	}
+	p.closeMoves()
 	p.signal()
 }
 
@@ -224,17 +230,90 @@ func (p *Player) State() []byte {
 func (p *Player) Changes() <-chan struct{} { return p.changes }
 
 // Submit makes a move and returns its sequence number. It retries with the same
-// ID until a host commits it or ctx ends (after 10 s if ctx has no deadline);
-// the ID makes a retry count once, unless room.Receipts of this player's later
-// moves commit in between (only possible with many Submits running at once).
-// It returns once this player's own copy holds the move, or at most a second
-// after the host committed it.
+// ID until a host commits it or ctx ends (after 10 s if ctx has no deadline),
+// and the ID makes the retries count once. It returns once this player's own
+// copy holds the move, or at most a second after the host committed it.
 func (p *Player) Submit(ctx context.Context, id string, cmd []byte) (int, error) {
+	t, err := p.window.enter(ctx, p.done)
+	if err != nil {
+		return 0, err
+	}
+	defer p.window.leave(t)
 	seq, err := p.retry(ctx, func() (reply, error) { return p.try(ctx, id, cmd) })
 	if err == nil {
 		p.catchUp(seq, time.Second)
 	}
 	return seq, err
+}
+
+// window keeps a retry recognisable: the host remembers a player's last
+// room.Receipts commands, so a Submit may not begin while `ahead` or more of
+// this player's Submits began after the oldest one still running. Then at most
+// twice that many of its moves, half of room.Receipts, can commit while any one
+// of them is undecided. The other half is slack for moves of Submits that gave
+// up and still commit late. Like a TCP window: tickets in order, the oldest
+// unfinished one holds the window back.
+type window struct {
+	mu       sync.Mutex
+	next     int                   // the next ticket
+	oldest   int                   // the oldest ticket whose Submit is running
+	finished map[int]bool          // finished tickets after oldest
+	waiting  map[int]chan struct{} // tickets not yet let in, closed when they are
+}
+
+const ahead = room.Receipts / 4 // how far a ticket may be past the oldest one running
+
+// enter takes a ticket and waits until the window lets it in.
+func (w *window) enter(ctx context.Context, closed <-chan struct{}) (int, error) {
+	w.mu.Lock()
+	t := w.next
+	w.next++
+	if t < w.oldest+ahead {
+		w.mu.Unlock()
+		return t, nil
+	}
+	if w.waiting == nil {
+		w.waiting = make(map[int]chan struct{})
+	}
+	in := make(chan struct{})
+	w.waiting[t] = in
+	w.mu.Unlock()
+	var err error
+	select {
+	case <-in:
+		return t, nil
+	case <-ctx.Done():
+		err = ctx.Err()
+	case <-closed:
+		err = errClosed
+	}
+	w.leave(t)
+	return 0, err
+}
+
+// leave releases a ticket. Each ticket is passed over once, so this is O(1)
+// on average.
+func (w *window) leave(t int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.waiting, t)
+	if t != w.oldest {
+		if w.finished == nil {
+			w.finished = make(map[int]bool)
+		}
+		w.finished[t] = true
+		return
+	}
+	from := w.oldest + ahead
+	for w.oldest++; w.finished[w.oldest]; w.oldest++ {
+		delete(w.finished, w.oldest)
+	}
+	for n := from; n < w.oldest+ahead; n++ {
+		if in, ok := w.waiting[n]; ok {
+			close(in)
+			delete(w.waiting, n)
+		}
+	}
 }
 
 // catchUp waits until the local copy reaches version seq, or for at most d.

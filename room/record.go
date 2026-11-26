@@ -11,7 +11,7 @@ import (
 )
 
 // Record is what a member keeps on disk once a game is over: its result, not
-// its moves. Nothing is written while the game is being played.
+// its moves (those go to a moves file for a while, see Moves).
 type Record struct {
 	ID               string
 	Status           string // "finished", "expired", or "interrupted" if this member left before the end

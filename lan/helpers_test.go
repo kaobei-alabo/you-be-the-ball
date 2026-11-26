@@ -13,6 +13,9 @@ import (
 // theGame is what the helpers play; a test may swap it.
 var theGame game.Game = counter.Game{}
 
+// keepMoves: the players of play keep their moves, as the CLI's do by default.
+var keepMoves = true
+
 var fast = Timing{Heartbeat: 100 * time.Millisecond, Lease: 50 * time.Millisecond, Commit: 2 * time.Millisecond}
 
 func newNode(t *testing.T, dir string) *Node {
@@ -59,7 +62,7 @@ func play(t *testing.T, c room.Config, tm Timing) []*Player {
 
 func playOn(t *testing.T, nodes []*Node, c room.Config, tm Timing) []*Player {
 	t.Helper()
-	h, err := Host(nodes[0], theGame, c, Options{Dir: t.TempDir(), Timing: tm})
+	h, err := Host(nodes[0], theGame, c, Options{Dir: t.TempDir(), KeepMoves: keepMoves, Timing: tm})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +73,7 @@ func playOn(t *testing.T, nodes []*Node, c room.Config, tm Timing) []*Player {
 		t.Fatal(err)
 	}
 	for _, n := range nodes[1:] {
-		p, err := join(t, n, inv, Options{Dir: t.TempDir(), Timing: tm})
+		p, err := join(t, n, inv, Options{Dir: t.TempDir(), KeepMoves: keepMoves, Timing: tm})
 		if err != nil {
 			t.Fatal(err)
 		}

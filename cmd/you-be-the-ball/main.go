@@ -23,9 +23,11 @@ func main() {
 }
 
 const usage = `you-be-the-ball host|find|join [flags] [invite]
+  you-be-the-ball replay [-profile NAME | -dir PATH] [ROOM_ID | FILE.moves]
   you-be-the-ball migrate OLD_PROFILE_DIR [OLD_PROFILE_DIR ...]
   you-be-the-ball help
 Defaults: ~/.you-be-the-ball/config.json and ~/.you-be-the-ball/{host,join,find}/
+replay without a room lists the kept games; without -profile it looks in every profile.
 Flags: you-be-the-ball host -h`
 
 // Tests shorten these; there are no flags for them.
@@ -44,12 +46,19 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	case "help", "-h", "--help":
 		fmt.Fprintln(stdout, usage)
 		return nil
-	case "host", "find", "join", "migrate":
+	case "host", "find", "join", "migrate", "replay":
 	default:
 		return errors.New(usage)
 	}
 	root, err := home.Root()
 	if err != nil {
+		return err
+	}
+	if mode == "replay" {
+		err := replay(root, args[1:], stdout, stderr)
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
 		return err
 	}
 	if mode == "migrate" {
@@ -79,13 +88,14 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		}
 	}
 	fmt.Fprintln(stderr, "Data directory:", o.dir)
+	_, _ = room.PurgeMoves(o.dir, o.keep, time.Now()) // quietly: only a replay is at stake
 	n, err := lan.New(o.dir, o.listen)
 	if err != nil {
 		return err
 	}
 	defer n.Close()
 	ctx := context.Background()
-	opts := lan.Options{Dir: o.dir, Timing: timing}
+	opts := lan.Options{Dir: o.dir, KeepMoves: o.keep > 0, Timing: timing}
 	var p *lan.Player
 	switch mode {
 	case "find":

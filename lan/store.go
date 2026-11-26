@@ -3,7 +3,10 @@ package lan
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"io"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/raft"
 )
@@ -133,4 +136,60 @@ func (s *store) GetUint64(k []byte) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.ints[string(k)], nil
+}
+
+// snapshots keeps the latest snapshot in RAM. Unlike raft.InmemSnapshotStore it
+// shows a snapshot only once it is whole: that one lists it as soon as it is
+// begun, so the host could send a player half of it.
+type snapshots struct {
+	mu   sync.Mutex
+	meta *raft.SnapshotMeta // nil until the first is complete
+	data []byte
+}
+
+type sink struct {
+	s    *snapshots
+	meta raft.SnapshotMeta
+	buf  bytes.Buffer
+}
+
+func (s *snapshots) Create(v raft.SnapshotVersion, index, term uint64, c raft.Configuration, ci uint64, _ raft.Transport) (raft.SnapshotSink, error) {
+	id := fmt.Sprintf("%d-%d-%d", term, index, time.Now().UnixMilli())
+	return &sink{s: s, meta: raft.SnapshotMeta{Version: v, ID: id, Index: index, Term: term, Configuration: c, ConfigurationIndex: ci}}, nil
+}
+
+func (s *snapshots) List() ([]*raft.SnapshotMeta, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.meta == nil {
+		return nil, nil
+	}
+	m := *s.meta
+	return []*raft.SnapshotMeta{&m}, nil
+}
+
+func (s *snapshots) Open(id string) (*raft.SnapshotMeta, io.ReadCloser, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.meta == nil || s.meta.ID != id {
+		return nil, nil, fmt.Errorf("no snapshot %s", id)
+	}
+	m := *s.meta
+	return &m, io.NopCloser(bytes.NewReader(s.data)), nil
+}
+
+func (k *sink) Write(b []byte) (int, error) { return k.buf.Write(b) }
+func (k *sink) ID() string                  { return k.meta.ID }
+func (k *sink) Cancel() error               { return nil }
+
+// Close publishes the snapshot; its bytes are never written again. One that
+// finishes after a newer one is dropped: the log before the newer is gone.
+func (k *sink) Close() error {
+	k.meta.Size = int64(k.buf.Len())
+	k.s.mu.Lock()
+	defer k.s.mu.Unlock()
+	if k.s.meta == nil || k.meta.Index >= k.s.meta.Index {
+		k.s.meta, k.s.data = &k.meta, k.buf.Bytes()
+	}
+	return nil
 }

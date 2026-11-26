@@ -239,7 +239,7 @@ func TestFinishWritesTheSameRecordForEveryPlayer(t *testing.T) {
 		inc(t, p, fmt.Sprint("move-id-", i))
 	}
 	for _, p := range ps {
-		if files, _ := os.ReadDir(p.o.Dir); len(files) != 0 {
+		if files, _ := os.ReadDir(filepath.Join(p.o.Dir, "games")); len(files) != 1 || files[0].Name() != p.id+".moves" {
 			t.Fatal("written while playing:", files)
 		}
 	}
@@ -267,7 +267,7 @@ func TestFinishWritesTheSameRecordForEveryPlayer(t *testing.T) {
 		if file != filepath.Join(p.o.Dir, "games", p.id+".json") {
 			t.Fatal("record at", file)
 		}
-		// Only the result is kept: no move, command ID or mover.
+		// The record holds the result only: no move, command ID or mover.
 		data, err := os.ReadFile(file)
 		if err != nil {
 			t.Fatal(err)
