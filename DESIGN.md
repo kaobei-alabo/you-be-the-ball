@@ -1,6 +1,30 @@
 # you-be-the-ball: a player-hosted room for Go games
 
-Original design proposal. See README.md for the implemented prototype, its limits, and the smoke test. The first target is a small room of native Go peers with one trusted player hosting. The core owns membership and replication of shared state; the game owns the meaning of a move. No dedicated game server is required. The first milestone is deliberately limited to a LAN.
+## Current design
+
+What is implemented now (see README.md for how to use it):
+
+- **Lobby on the creator.** Before the start, only the creator's program holds the room; guests take seats over the lobby protocol.
+- **Raft after the start.** The ordered event log is replicated with Raft (github.com/hashicorp/raft v1.8.0), in memory on every player. The host is the elected leader. A move counts once a majority of voters hold it, so there are never two hosts whose moves can count.
+- **Random successor.** Raft's randomized election timeouts pick the next host when the current one drops out; a host that quits hands over to a random other voter first (with two players there is none). The creator is the first host.
+- **Two players.** Only the creator votes: if the guest drops, the host plays on and the guest catches up; if the host drops, the game pauses; if the host's program closes, the game ends as `interrupted` for both.
+- **One replication address per run.** Each run of the program uses `<peerID>/<roomID>/<nonce>` as its Raft address, so a restarted program with an empty memory cannot be mistaken for its old self.
+- **Rejoining after a restart.** A restarted program joins again with the same identity and a new replication address. Any member tells it where the host is; only the host sends it the Setup (a different one from a later answer fails the rejoin) and where the other members are now. The host removes the old run's Raft server, adds the new one as a nonvoter and, once it holds the host's version, makes it a voter again if its seat votes. This needs a host.
+- **Compaction.** Old entries are replaced by a small snapshot of the game (its state, version and recent receipts), so a game can run for any number of moves; a far-behind or rejoining player is brought up to date from the snapshot. When the game ends, every player drops its log: only the snapshot of the result remains in memory.
+- **A result, and moves for a while.** Each player writes the result to `games/<roomID>.json` once, when the game finishes or expires or when it leaves mid-game; it stays until the user deletes it. While playing, each player appends every move it applies to `games/<roomID>.moves` (buffered, flushed every second, one fsync at the end) for replays. Moves files are kept 3 days by default after their last write, then purged the next time the program runs. A player's file has a gap where it was brought up to date from a snapshot; a replay reports it.
+- **A window on Submit.** A player's concurrent Submits may run at most `room.Receipts/4` ahead of its oldest unfinished one, so the host still remembers a move's receipt when Submit retries it.
+- **One game per build.** A second selectable game needs a game name in `room.Config` and `Setup`, checked on join.
+
+These statements in the proposal below no longer hold:
+
+- A move is durable because a majority of players hold it in memory; the moves files are only for replays, never read by the game.
+- Hosts change: if the host drops out, the others elect one (not with two players). No game resumes from disk: a player whose program restarted gets its seat back from the other players' memory, through the host.
+- Nothing is purged at expiry. Results are kept until the user deletes them; moves are kept on disk for a set time (3 days by default) after the game, and are dropped from memory when it ends.
+- Retries are recognised only among each player's last 1,024 moves (`room.Receipts`) and only while the game is played; its receipts go when it ends.
+
+## Original design proposal
+
+See README.md for the implemented prototype, its limits, and the offline demo. The first target is a small room of native Go peers with one trusted player hosting. The core owns membership and replication of shared state; the game owns the meaning of a move. No dedicated game server is required. The first milestone is deliberately limited to a LAN.
 
 ## What a game can ask for
 

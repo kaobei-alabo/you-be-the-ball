@@ -3,7 +3,7 @@ on: [push, pull_request]
 permissions:
   contents: read
 jobs:
-  room-and-lan:
+  test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -12,10 +12,9 @@ jobs:
         with:
           go-version: '1.26.x'
           cache: false
+      - run: go mod tidy -diff
+      - run: go vet ./...
+      - run: test -z "$(gofmt -l .)"
       - run: go test -race ./...
       - run: go run ./cmd/demo
-      - working-directory: lan
-        run: |
-          go mod tidy
-          go test -race ./...
-          go build -o "$RUNNER_TEMP/you-be-the-ball" ./cmd/you-be-the-ball
+      - run: go build -o "$RUNNER_TEMP/you-be-the-ball" ./cmd/you-be-the-ball

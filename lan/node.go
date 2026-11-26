@@ -1,4 +1,5 @@
-// Package lan binds the transport-neutral room protocol to authenticated libp2p streams.
+// Package lan plays a room over libp2p: the lobby protocol before the start,
+// Raft replication of every player's copy after it, and the API a front end uses.
 package lan
 
 import (
@@ -7,25 +8,26 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"time"
+	"sync"
 
 	libp2p "github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/control"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	"github.com/libp2p/go-libp2p/p2p/net/swarm"
+	ma "github.com/multiformats/go-multiaddr"
 
-	"you-be-the-ball.local/core/room"
-	"you-be-the-ball.local/core/session"
+	"github.com/kaobei-alabo/you-be-the-ball/room"
 )
 
-// Keep the v1 discovery name interoperable with pre-rename builds.
-const service = "_p2pcore-v1._udp"
+// A new name, so builds that speak the old protocol do not list new rooms.
+const service = "_ybtb-v2._udp"
 
 type Invite struct {
 	Room   string
@@ -95,50 +97,146 @@ func identity(dir string) (crypto.PrivKey, error) {
 	return key, nil
 }
 
-func New(dir, listen string) (host.Host, error) {
+// Node is this program's libp2p host. It serves the lobby protocol for every
+// Player made from it.
+type Node struct {
+	h     host.Host // unexported: front ends must not replace the protocol handlers
+	gate  *gate
+	mu    sync.Mutex
+	rooms map[string]*Player
+}
+
+func New(dir, listen string) (*Node, error) {
 	key, err := identity(dir)
 	if err != nil {
 		return nil, err
 	}
-	return libp2p.New(libp2p.Identity(key), libp2p.ListenAddrStrings(listen), libp2p.DisableRelay())
-}
-
-func Serve(h host.Host, r *room.Room) {
-	h.SetStreamHandler(session.Protocol, func(s network.Stream) { session.Serve(s, r, s.Conn().RemotePeer().String()) })
-}
-
-func Invitation(h host.Host, r *room.Room) (Invite, error) {
-	id, secret, err := r.Invite()
+	g := &gate{blocked: make(map[peer.ID]bool)}
+	h, err := libp2p.New(libp2p.Identity(key), libp2p.ListenAddrStrings(listen), libp2p.DisableRelay(), libp2p.ConnectionGater(g))
 	if err != nil {
-		return Invite{}, err
-	}
-	// Use local listening interfaces, not addresses chosen for public advertisement.
-	addrs, err := h.Network().InterfaceListenAddresses()
-	if err != nil {
-		return Invite{}, err
-	}
-	if len(addrs) == 0 {
-		return Invite{}, errors.New("no listening addresses")
-	}
-	return Invite{Room: id, Host: peer.AddrInfo{ID: h.ID(), Addrs: addrs}, Secret: secret}, nil
-}
-
-func Dial(ctx context.Context, h host.Host, p peer.AddrInfo) (network.Stream, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if err := h.Connect(ctx, p); err != nil {
 		return nil, err
 	}
-	return h.NewStream(ctx, p.ID, session.Protocol)
+	n := &Node{h: h, gate: g, rooms: make(map[string]*Player)}
+	h.SetStreamHandler(lobbyProto, n.serve)
+	h.SetStreamHandler(oldProto, upgrade)
+	return n, nil
 }
+
+func (n *Node) ID() peer.ID  { return n.h.ID() }
+func (n *Node) Close() error { return n.h.Close() }
+
+// SetOffline refuses and closes every connection while on, as if the network
+// cable were pulled, without stopping the program.
+func (n *Node) SetOffline(on bool) {
+	n.gate.mu.Lock()
+	n.gate.offline = on
+	n.gate.mu.Unlock()
+	n.reset(n.h.Network().Peers()...)
+}
+
+// block cuts this node off from one peer (tests).
+func (n *Node) block(p peer.ID, on bool) {
+	n.gate.mu.Lock()
+	n.gate.blocked[p] = on
+	n.gate.mu.Unlock()
+	n.reset(p)
+}
+
+// reset drops connections and forgets failed dials, so a healed link is used at once.
+func (n *Node) reset(peers ...peer.ID) {
+	for _, p := range peers {
+		_ = n.h.Network().ClosePeer(p)
+	}
+	n.forget(n.h.Peerstore().Peers()...)
+}
+
+// forget clears libp2p's dial backoff (5 s or more), which would otherwise keep
+// a peer that is back online unreachable for that long.
+func (n *Node) forget(peers ...peer.ID) {
+	if s, ok := n.h.Network().(*swarm.Swarm); ok {
+		for _, p := range peers {
+			s.Backoff().Clear(p)
+		}
+	}
+}
+
+func (n *Node) addrs() ([]ma.Multiaddr, error) {
+	// Local interfaces, not addresses chosen for public advertisement.
+	addrs, err := n.h.Network().InterfaceListenAddresses()
+	if err == nil && len(addrs) == 0 {
+		err = errors.New("no listening addresses")
+	}
+	return addrs, err
+}
+
+func (n *Node) add(p *Player) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.rooms[p.id] != nil {
+		return errors.New("already in this room")
+	}
+	n.rooms[p.id] = p
+	return nil
+}
+
+func (n *Node) remove(p *Player) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.rooms[p.id] == p {
+		delete(n.rooms, p.id)
+	}
+}
+
+func (n *Node) room(id string) *Player {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.rooms[id]
+}
+
+func (n *Node) listing() (room.LobbyInfo, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for _, p := range n.rooms {
+		if p.lobby != nil {
+			if info, err := p.lobby.Listing(); err == nil {
+				return info, nil
+			}
+		}
+	}
+	return room.LobbyInfo{}, errors.New("no open public room")
+}
+
+type gate struct {
+	mu      sync.Mutex
+	offline bool
+	blocked map[peer.ID]bool
+}
+
+func (g *gate) allow(p peer.ID) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return !g.offline && !g.blocked[p]
+}
+
+func (g *gate) InterceptPeerDial(p peer.ID) bool                 { return g.allow(p) }
+func (g *gate) InterceptAddrDial(p peer.ID, _ ma.Multiaddr) bool { return g.allow(p) }
+func (g *gate) InterceptAccept(network.ConnMultiaddrs) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return !g.offline
+}
+func (g *gate) InterceptSecured(_ network.Direction, p peer.ID, _ network.ConnMultiaddrs) bool {
+	return g.allow(p)
+}
+func (g *gate) InterceptUpgraded(network.Conn) (bool, control.DisconnectReason) { return true, 0 }
 
 type notify func(peer.AddrInfo)
 
 func (f notify) HandlePeerFound(p peer.AddrInfo) { f(p) }
 
 // Advertise announces the peer, not its room, roster, or invite secret.
-func Advertise(h host.Host) (io.Closer, error) {
-	srv := mdns.NewMdnsService(h, service, notify(func(peer.AddrInfo) {}))
+func Advertise(n *Node) (io.Closer, error) {
+	srv := mdns.NewMdnsService(n.h, service, notify(func(peer.AddrInfo) {}))
 	if err := srv.Start(); err != nil {
 		srv.Close()
 		return nil, err
@@ -146,11 +244,11 @@ func Advertise(h host.Host) (io.Closer, error) {
 	return srv, nil
 }
 
-// Browse asks nearby nodes for a public lobby, without admitting the browsing peer.
-func Browse(ctx context.Context, h host.Host, found func(Invite, room.Info)) error {
+// Browse asks nearby nodes for a public lobby with a free seat. It takes no seat.
+func Browse(ctx context.Context, n *Node, found func(Invite, room.LobbyInfo)) error {
 	peers := make(chan peer.AddrInfo, 32)
-	srv := mdns.NewMdnsService(h, service, notify(func(p peer.AddrInfo) {
-		if p.ID != h.ID() {
+	srv := mdns.NewMdnsService(n.h, service, notify(func(p peer.AddrInfo) {
+		if p.ID != n.ID() {
 			select {
 			case peers <- p:
 			default:
@@ -171,11 +269,7 @@ func Browse(ctx context.Context, h host.Host, found func(Invite, room.Info)) err
 			if seen[p.ID] {
 				continue
 			}
-			s, err := Dial(ctx, h, p)
-			if err != nil {
-				continue
-			}
-			info, err := session.Listing(s)
+			info, err := list(ctx, n, p)
 			if err != nil || info.Host != p.ID.String() {
 				continue
 			}
@@ -185,10 +279,21 @@ func Browse(ctx context.Context, h host.Host, found func(Invite, room.Info)) err
 	}
 }
 
-func Join(ctx context.Context, h host.Host, i Invite, c *session.Client) error {
-	s, err := Dial(ctx, h, i.Host)
-	if err != nil {
-		return fmt.Errorf("dial room host: %w", err)
+// list asks one node for its public lobby.
+func list(ctx context.Context, n *Node, p peer.AddrInfo) (room.LobbyInfo, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if err := n.h.Connect(ctx, p); err != nil {
+		return room.LobbyInfo{}, err
 	}
-	return c.Attach(s)
+	r, err := ask(ctx, n, p.ID, request{Op: "list"})
+	if err == nil && r.Err != "" {
+		err = errors.New(r.Err)
+	} else if err == nil && r.Lobby == nil {
+		err = errors.New("missing listing")
+	}
+	if err != nil {
+		return room.LobbyInfo{}, err
+	}
+	return *r.Lobby, nil
 }
