@@ -407,8 +407,13 @@ func TestSnapshotRestoresAnIdenticalCopy(t *testing.T) {
 	if again := submit(t, c, "bob", "bob-1"); !again.Repeat || again.Seq != 2 {
 		t.Fatal("receipts lost:", again)
 	}
+	// The host decides once; every copy applies that entry.
+	e, _, err := s.Decide("host", "host-1", []byte("inc"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, x := range []*room.State{s, c} {
-		if r := submit(t, x, "host", "host-1"); r.Seq != 4 {
+		if r := x.Apply(e); r.Seq != 4 {
 			t.Fatal(r)
 		}
 	}

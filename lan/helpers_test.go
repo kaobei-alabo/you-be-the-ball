@@ -62,7 +62,13 @@ func play(t *testing.T, c room.Config, tm Timing) []*Player {
 
 func playOn(t *testing.T, nodes []*Node, c room.Config, tm Timing) []*Player {
 	t.Helper()
-	h, err := Host(nodes[0], theGame, c, Options{Dir: t.TempDir(), KeepMoves: keepMoves, Timing: tm})
+	return playGames(t, nodes, c, tm, func(int) game.Game { return theGame })
+}
+
+// playGames is playOn with player i playing games(i).
+func playGames(t *testing.T, nodes []*Node, c room.Config, tm Timing, games func(int) game.Game) []*Player {
+	t.Helper()
+	h, err := Host(nodes[0], games(0), c, Options{Dir: t.TempDir(), KeepMoves: keepMoves, Timing: tm})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,11 +78,14 @@ func playOn(t *testing.T, nodes []*Node, c room.Config, tm Timing) []*Player {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, n := range nodes[1:] {
-		p, err := join(t, n, inv, Options{Dir: t.TempDir(), KeepMoves: keepMoves, Timing: tm})
+	for i, n := range nodes[1:] {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		p, err := Join(ctx, n, games(i+1), inv, Options{Dir: t.TempDir(), KeepMoves: keepMoves, Timing: tm})
+		cancel()
 		if err != nil {
 			t.Fatal(err)
 		}
+		t.Cleanup(func() { p.Close() })
 		ps = append(ps, p)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

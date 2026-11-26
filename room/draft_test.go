@@ -2,7 +2,9 @@ package room_test
 
 import (
 	"errors"
+	"math/rand/v2"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/kaobei-alabo/you-be-the-ball/game/counter"
@@ -155,5 +157,97 @@ func TestDraftStopsAtAGameThatEndsItself(t *testing.T) {
 	}
 	if _, _, err := s.Draft().Decide("bob", "c", []byte("inc")); !errors.Is(err, room.ErrOver) {
 		t.Fatal(err)
+	}
+}
+
+// trail is a game whose state is the list of moves made so far and whose event
+// is the whole list the host expected after the move. A move applied on any
+// other state than the one it was decided on therefore loses or invents moves.
+type trail struct{}
+
+func (trail) Initial() []byte { return nil }
+func (trail) Decide(state []byte, _ string, cmd []byte) ([]byte, error) {
+	return append(append(state, ','), cmd...), nil
+}
+func (trail) Apply(_, event []byte) ([]byte, error) { return event, nil }
+
+// Rounds are drafted from copies that may lag, entries go missing, and other
+// hosts' entries get in between. Whatever happens, a move is applied only on
+// the state it was decided on, and every copy agrees.
+func TestAMoveIsOnlyAppliedOnTheStateItWasDecidedOn(t *testing.T) {
+	players := []string{"host", "bob", "carol"}
+	for seed := uint64(1); seed <= 300; seed++ {
+		rnd := rand.New(rand.NewPCG(seed, 7))
+		l, _ := room.NewLobby(room.Config{Host: "host", Players: 3})
+		id, _, _ := l.Invite()
+		for _, p := range players[1:] {
+			l.Join(member(p), id, "")
+		}
+		setup, _ := l.Start(member("host"))
+		truth, _ := room.NewState(setup, trail{})
+		var log []room.Entry
+		var applied []string
+		snaps := [][]byte{[]byte(snap(t, truth))}
+		next := 0
+		draft := func(from *room.State, n int) (out []room.Entry) {
+			d := from.Draft()
+			for range n {
+				next++
+				if e, done, err := d.Decide(players[rnd.IntN(3)], "m"+strconv.Itoa(next), []byte("m"+strconv.Itoa(next))); err == nil && done == nil {
+					out = append(out, e)
+				}
+			}
+			return
+		}
+		commit := func(e room.Entry) {
+			log = append(log, e)
+			if r := truth.Apply(e); r.Seq > 0 && !r.Repeat {
+				applied = append(applied, e.CommandID)
+			}
+			snaps = append(snaps, []byte(snap(t, truth)))
+		}
+		for range 25 {
+			// The host drafts from what it has applied: sometimes not everything yet.
+			from := truth
+			if rnd.IntN(3) == 0 {
+				from, _ = room.Restore(snaps[rnd.IntN(len(snaps))], trail{})
+			}
+			for _, e := range draft(from, 1+rnd.IntN(5)) {
+				if rnd.IntN(5) == 0 {
+					continue // this entry never makes it
+				}
+				if rnd.IntN(5) == 0 {
+					for _, f := range draft(truth, 1+rnd.IntN(2)) { // another host's round
+						commit(f)
+					}
+				}
+				commit(e)
+			}
+		}
+		want := ""
+		for _, id := range applied {
+			want += "," + id
+		}
+		if got := string(truth.View()); got != want {
+			t.Fatalf("seed %d: the game holds %q but the moves that counted are %q", seed, got, want)
+		}
+		if truth.Info().Version != len(applied)+1 {
+			t.Fatalf("seed %d: version %d after %d moves", seed, truth.Info().Version, len(applied))
+		}
+		// A copy that replays the log, restored from a snapshot on the way, agrees.
+		copy2, _ := room.NewState(setup, trail{})
+		cut := rnd.IntN(len(log) + 1)
+		for i, e := range log {
+			if i == cut {
+				copy2, _ = room.Restore([]byte(snap(t, copy2)), trail{})
+			}
+			copy2.Apply(e)
+		}
+		if snap(t, copy2) != snap(t, truth) {
+			t.Fatalf("seed %d: copies differ", seed)
+		}
+		if strings.Count(want, ",") != len(applied) {
+			t.Fatal("bad test")
+		}
 	}
 }

@@ -89,9 +89,14 @@ type Player struct {
 	window window // bounds this player's concurrent Submits
 
 	seats     sync.Mutex // orders lobby broadcasts
-	proposing sync.Mutex
+	proposing sync.Mutex // one round at a time (replica.go)
 	rejoining sync.Mutex // one membership change at a time (rejoin.go)
 	barrier   uint64     // term in which a Barrier last succeeded
+
+	// Guarded by mu (replica.go):
+	queue            []*proposal // waiting for the host's next round
+	serving          bool        // a caller of propose is serving rounds
+	rounds, proposed int         // rounds that proposed entries, and those entries (tests)
 }
 
 func newPlayer(n *Node, g game.Game, o Options, id string) *Player {
@@ -370,7 +375,7 @@ func (p *Player) retry(ctx context.Context, f func() (reply, error)) (int, error
 		case err != nil:
 			return 0, err
 		case r.Err != "":
-			return 0, errors.New(r.Err)
+			return 0, remote(r.Err)
 		case r.Seq > 0:
 			return r.Seq, nil
 		}
@@ -382,6 +387,16 @@ func (p *Player) retry(ctx context.Context, f func() (reply, error)) (int, error
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
+}
+
+// remote is an error the host answered, as the sentinel a caller can test for.
+func remote(msg string) error {
+	for _, err := range []error{room.ErrOver, room.ErrExpired} {
+		if msg == err.Error() {
+			return err
+		}
+	}
+	return errors.New(msg)
 }
 
 func (p *Player) try(ctx context.Context, id string, cmd []byte) (reply, error) {
