@@ -19,6 +19,18 @@ import (
 
 var errTimeout = errors.New("timed out")
 
+// compaction keeps raft's in-memory log bounded however many moves a game
+// takes: every interval (randomised up to twice that) raft checks, cheaply,
+// whether threshold entries arrived since its last snapshot; if so it
+// snapshots the state, which is small, and keeps only the last trailing
+// entries. A turn-based game snapshots once in 1,024 moves; a fast one holds
+// about trailing + 0.2 s of moves. A player briefly offline catches up from the
+// trailing entries, one further behind from the snapshot. Tests shrink it.
+var compaction = struct {
+	interval            time.Duration
+	threshold, trailing uint64
+}{100 * time.Millisecond, 1024, 1024}
+
 // wait bounds a raft future: Error can block forever on a node shutting down.
 func wait(f raft.Future, d time.Duration) error {
 	done := make(chan error, 1)
@@ -80,6 +92,7 @@ func (p *Player) begin(setup room.Setup, rejoin bool) error {
 	c.LocalID = raft.ServerID(p.self)
 	c.HeartbeatTimeout, c.ElectionTimeout = t.Heartbeat, t.Heartbeat
 	c.LeaderLeaseTimeout, c.CommitTimeout = t.Lease, t.Commit
+	c.SnapshotInterval, c.SnapshotThreshold, c.TrailingLogs = compaction.interval, compaction.threshold, compaction.trailing
 	c.Logger = hclog.NewNullLogger()
 	trans := raft.NewNetworkTransportWithLogger(l, 3, 2*time.Second, hclog.NewNullLogger())
 	p.mu.Lock()
@@ -100,7 +113,7 @@ func (p *Player) begin(setup room.Setup, rejoin bool) error {
 	r.RegisterObserver(obs)
 	p.mu.Lock()
 	closed := p.closed
-	p.raft, p.layer, p.obs, p.obsCh = r, l, obs, ch
+	p.raft, p.layer, p.obs, p.obsCh, p.logs = r, l, obs, ch, s
 	p.mu.Unlock()
 	if closed {
 		p.shutdown(r, l, obs, ch)
@@ -135,15 +148,35 @@ func (f *fsm) Apply(l *raft.Log) any {
 		return room.Result{Err: "invalid entry"}
 	}
 	p.mu.Lock()
+	was := p.state.Info().Phase
 	res := p.state.Apply(e)
 	over := p.state.Info().Phase != room.Playing
+	r := p.raft
 	p.changed()
 	p.mu.Unlock()
 	if over {
 		p.save()
+		if was == room.Playing {
+			flush(r)
+		}
 	}
 	p.signal()
 	return res
+}
+
+// flush drops the moves from memory once the game is over: the next snapshot,
+// of the result alone, replaces the whole log, and a player that missed the end
+// is sent that snapshot. raft takes snapshots on the goroutine that calls
+// Apply, so Apply must not wait for one.
+func flush(r *raft.Raft) {
+	if r == nil { // the game ended before begin finished: the log stays bounded
+		return
+	}
+	rc := r.ReloadableConfig()
+	rc.TrailingLogs = 0
+	if r.ReloadConfig(rc) == nil {
+		go r.Snapshot()
+	}
 }
 
 type snapshot []byte

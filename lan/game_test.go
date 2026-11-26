@@ -193,7 +193,7 @@ func TestRetriesAcrossHostChangesApplyOnce(t *testing.T) {
 					}
 				}
 				w.acked++
-				if n == 700 { // 5 x 700 stays under room.MaxEvents
+				if n == 700 { // keeps the test short
 					<-w.stop
 					return
 				}
@@ -225,18 +225,10 @@ func TestRetriesAcrossHostChangesApplyOnce(t *testing.T) {
 		<-w.done
 		total += w.acked
 	}
+	// Each acknowledged move counted once: the counter and the version say so.
 	converged(t, live, strconv.Itoa(total))
-	for _, p := range live {
-		p.mu.Lock()
-		seen := map[string]bool{}
-		for _, e := range p.state.Events(0) {
-			key := e.Peer + "/" + e.CommandID
-			if e.Kind == room.KindGame && seen[key] {
-				t.Errorf("%s applied twice", key)
-			}
-			seen[key] = true
-		}
-		p.mu.Unlock()
+	if v := live[0].Status().Version; v != total+1 {
+		t.Errorf("version %d after %d moves", v, total)
 	}
 	t.Logf("%d moves acknowledged", total)
 }
@@ -244,7 +236,7 @@ func TestRetriesAcrossHostChangesApplyOnce(t *testing.T) {
 func TestFinishWritesTheSameRecordForEveryPlayer(t *testing.T) {
 	ps := play(t, room.Config{Players: 3}, fast)
 	for i, p := range ps {
-		inc(t, p, fmt.Sprint("m", i))
+		inc(t, p, fmt.Sprint("move-id-", i))
 	}
 	for _, p := range ps {
 		if files, _ := os.ReadDir(p.o.Dir); len(files) != 0 {
@@ -275,19 +267,32 @@ func TestFinishWritesTheSameRecordForEveryPlayer(t *testing.T) {
 		if file != filepath.Join(p.o.Dir, "games", p.id+".json") {
 			t.Fatal("record at", file)
 		}
+		// Only the result is kept: no move, command ID or mover.
+		data, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, detail := range []string{"move-id-", "aW5j" /* "inc" */, "Events", "CommandID", "Peer", "Body", "Kind"} {
+			if bytes.Contains(data, []byte(detail)) {
+				t.Errorf("the record holds %q:\n%s", detail, data)
+			}
+		}
 		r, err := room.ReadRecord(file)
 		if err != nil || r.Status != "finished" {
 			t.Fatal(r.Status, err)
 		}
 		if i == 0 {
 			first = r
-		} else if !bytes.Equal(r.State, first.State) || !reflect.DeepEqual(r.Events, first.Events) {
-			t.Fatal("records differ")
+		} else if !reflect.DeepEqual(r, first) {
+			t.Fatal("records differ", r, first)
 		}
 		fails(t, p, "late", time.Second)
+		if _, err := p.Submit(context.Background(), "move-id-0", []byte("inc")); !errors.Is(err, room.ErrOver) {
+			t.Fatal("a retry after the end:", err)
+		}
 	}
-	if string(first.State) != "3" || len(first.Events) != 5 {
-		t.Fatal("record", string(first.State), first.Events)
+	if string(first.Result) != "3" || first.Version != 5 {
+		t.Fatal("record", string(first.Result), first.Version)
 	}
 }
 
@@ -298,7 +303,7 @@ func TestClosingMidGameSavesAnInterruptedRecord(t *testing.T) {
 	g := without(ps, leader(t, ps...))[0]
 	g.Close()
 	r, err := room.ReadRecord(g.Status().Record)
-	if err != nil || r.Status != "interrupted" || r.Version != 2 || string(r.State) != "1" {
+	if err != nil || r.Status != "interrupted" || r.Version != 2 || string(r.Result) != "1" {
 		t.Fatal(r, err)
 	}
 	if g.Status().Phase != "closed" || g.Close() != nil {
@@ -325,8 +330,9 @@ func TestExpiryEndsTheGameForEveryone(t *testing.T) {
 		}
 		return true
 	})
-	if again := inc(t, ps[1], "a"); again != seq {
-		t.Fatal("a retry after the deadline got", again, "not", seq)
+	// Once the game is over its receipts are gone too.
+	if again, err := ps[1].Submit(context.Background(), "a", []byte("inc")); !errors.Is(err, room.ErrExpired) {
+		t.Fatal("a retry after the deadline got", again, err, "first try", seq)
 	}
 	for _, p := range ps {
 		if _, err := p.Submit(context.Background(), "late", []byte("inc")); !errors.Is(err, room.ErrExpired) {

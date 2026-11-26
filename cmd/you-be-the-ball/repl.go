@@ -87,7 +87,7 @@ func repl(p *lan.Player, n *lan.Node, creator bool, stdin io.Reader, stdout io.W
 			cancel()
 			if err = e; err == nil {
 				o.println(fmt.Sprintf("committed %s at v%d", id, seq))
-			} else if len(f) == 1 {
+			} else if len(f) == 1 && errors.Is(e, lan.ErrNoHost) {
 				o.println("request ID (reuse if retrying):", id)
 			}
 		case "finish":

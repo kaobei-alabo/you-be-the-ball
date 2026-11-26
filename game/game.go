@@ -17,3 +17,9 @@ type Game interface {
 type Finisher interface {
 	Finished(state []byte) bool
 }
+
+// Resulter is optional. When a game is over, a player's record keeps what
+// Result returns, such as the score, in place of the whole final state.
+type Resulter interface {
+	Result(state []byte) []byte
+}

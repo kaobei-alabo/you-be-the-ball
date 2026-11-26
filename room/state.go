@@ -22,7 +22,7 @@ type Entry struct {
 
 // Result is the outcome of applying an entry. It is the same on every member.
 type Result struct {
-	Seq    int    `json:",omitempty"` // position of the event; the original one for a repeat
+	Seq    int    `json:",omitempty"` // position of the step; the original one for a repeat
 	Repeat bool   `json:",omitempty"` // the command had been applied before
 	Stale  bool   `json:",omitempty"` // decided against an older version: decide again
 	Err    string `json:",omitempty"` // rejected; nothing changed
@@ -44,13 +44,18 @@ type receipt struct{ peer, id string }
 // state and the entry: it reads no clock and does no IO, so members that apply
 // the same entries in the same order hold the same state. State is not safe for
 // concurrent use; the caller serializes access.
+//
+// A game may take any number of moves, so the moves themselves are not kept:
+// only the game's current state, how many steps led to it, and each player's
+// most recent receipts.
 type State struct {
 	setup    Setup
 	game     game.Game
 	phase    Phase
+	version  int // 1 is the start; every applied step adds one
 	state    []byte
-	events   []Event
 	receipts map[receipt]int
+	recent   map[string][]string // per player, oldest first: the IDs in receipts
 }
 
 func checkSetup(s Setup, g game.Game) error {
@@ -87,9 +92,10 @@ func NewState(s Setup, g game.Game) (*State, error) {
 		setup:    cloneSetup(s),
 		game:     g,
 		phase:    Playing,
+		version:  1,
 		state:    bytes.Clone(g.Initial()),
-		events:   []Event{{Seq: 1, Kind: KindStart, Peer: s.Roster[0].Peer}},
 		receipts: make(map[receipt]int),
+		recent:   make(map[string][]string),
 	}, nil
 }
 
@@ -97,17 +103,38 @@ func (s *State) member(peer string) bool {
 	return slices.ContainsFunc(s.setup.Roster, func(m Member) bool { return m.Peer == peer })
 }
 
-func (s *State) add(e Event) int {
-	e.Seq = len(s.events) + 1
-	s.events = append(s.events, e)
-	return e.Seq
+// remember keeps a receipt and forgets the player's oldest beyond the window.
+func (s *State) remember(peer, id string, seq int) {
+	s.receipts[receipt{peer, id}] = seq
+	ids := append(s.recent[peer], id)
+	if len(ids) > Receipts {
+		delete(s.receipts, receipt{peer, ids[0]})
+		ids = ids[1:]
+	}
+	s.recent[peer] = ids
+}
+
+// end closes the game. The moves' receipts go with it: once a game is over only
+// its result is kept.
+func (s *State) end(p Phase) int {
+	s.phase = p
+	s.version++
+	s.receipts, s.recent = make(map[receipt]int), make(map[string][]string)
+	return s.version
+}
+
+// Receipt is the sequence number of a command that was applied, if it is one of
+// the player's most recent Receipts commands of a game still being played.
+func (s *State) Receipt(peer, id string) (int, bool) {
+	seq, ok := s.receipts[receipt{peer, id}]
+	return seq, ok
 }
 
 // Decide validates a command against the current state and returns the entry to
 // propose. If the command was applied before, it returns that result instead and
 // no entry, so a retry gets its original receipt. Only the host calls Decide.
 func (s *State) Decide(actor, id string, cmd []byte) (Entry, *Result, error) {
-	if seq, ok := s.receipts[receipt{actor, id}]; ok {
+	if seq, ok := s.Receipt(actor, id); ok {
 		return Entry{}, &Result{Seq: seq, Repeat: true}, nil
 	}
 	if s.phase != Playing {
@@ -118,9 +145,6 @@ func (s *State) Decide(actor, id string, cmd []byte) (Entry, *Result, error) {
 	}
 	if id == "" || len(id) > maxID || len(cmd) > MaxPayload {
 		return Entry{}, nil, errors.New("invalid command ID or payload size")
-	}
-	if len(s.events) >= MaxEvents {
-		return Entry{}, nil, errors.New("room event limit reached")
 	}
 	body, err := s.game.Decide(bytes.Clone(s.state), actor, bytes.Clone(cmd))
 	if err != nil {
@@ -133,18 +157,12 @@ func (s *State) Decide(actor, id string, cmd []byte) (Entry, *Result, error) {
 	if _, err = s.game.Apply(bytes.Clone(s.state), bytes.Clone(body)); err != nil {
 		return Entry{}, nil, err
 	}
-	return Entry{Kind: KindGame, Peer: actor, CommandID: id, Body: bytes.Clone(body), Based: len(s.events)}, nil, nil
-}
-
-// Receipt returns the sequence number of peer's command id, if it was applied.
-func (s *State) Receipt(peer, id string) (int, bool) {
-	seq, ok := s.receipts[receipt{peer, id}]
-	return seq, ok
+	return Entry{Kind: KindGame, Peer: actor, CommandID: id, Body: bytes.Clone(body), Based: s.version}, nil, nil
 }
 
 // End returns the entry that finishes (KindFinish) or expires (KindExpire) the game.
 func (s *State) End(kind, peer string) Entry {
-	return Entry{Kind: kind, Peer: peer, Based: len(s.events)}
+	return Entry{Kind: kind, Peer: peer, Based: s.version}
 }
 
 // Apply performs an agreed entry. A rejected entry changes nothing and uses no
@@ -152,17 +170,17 @@ func (s *State) End(kind, peer string) Entry {
 func (s *State) Apply(e Entry) Result {
 	switch e.Kind {
 	case KindGame:
-		if seq, ok := s.receipts[receipt{e.Peer, e.CommandID}]; ok {
+		if seq, ok := s.Receipt(e.Peer, e.CommandID); ok {
 			return Result{Seq: seq, Repeat: true}
 		}
 		if s.phase != Playing {
 			return Result{Err: ErrOver.Error()}
 		}
 		// Another host may have committed something since this was decided.
-		if e.Based != len(s.events) {
+		if e.Based != s.version {
 			return Result{Stale: true}
 		}
-		if !s.member(e.Peer) || e.CommandID == "" || len(e.CommandID) > maxID || len(e.Body) > MaxPayload || len(s.events) >= MaxEvents {
+		if !s.member(e.Peer) || e.CommandID == "" || len(e.CommandID) > maxID || len(e.Body) > MaxPayload {
 			return Result{Err: "invalid entry"}
 		}
 		next, err := s.game.Apply(bytes.Clone(s.state), bytes.Clone(e.Body))
@@ -170,22 +188,21 @@ func (s *State) Apply(e Entry) Result {
 			return Result{Err: err.Error()}
 		}
 		s.state = next
-		seq := s.add(Event{Kind: KindGame, Peer: e.Peer, CommandID: e.CommandID, Body: bytes.Clone(e.Body)})
-		s.receipts[receipt{e.Peer, e.CommandID}] = seq
+		s.version++
+		seq := s.version
+		s.remember(e.Peer, e.CommandID, seq)
 		if f, ok := s.game.(game.Finisher); ok && f.Finished(bytes.Clone(s.state)) {
-			s.phase = Finished
-			s.add(Event{Kind: KindFinish, Peer: e.Peer})
+			s.end(Finished)
 		}
 		return Result{Seq: seq}
 	case KindFinish, KindExpire:
 		if s.phase != Playing {
-			return Result{Seq: len(s.events), Repeat: true}
+			return Result{Seq: s.version, Repeat: true}
 		}
-		s.phase = Finished
 		if e.Kind == KindExpire {
-			s.phase = Expired
+			return Result{Seq: s.end(Expired)}
 		}
-		return Result{Seq: s.add(Event{Kind: e.Kind, Peer: e.Peer})}
+		return Result{Seq: s.end(Finished)}
 	}
 	return Result{Err: "unknown entry"}
 }
@@ -195,7 +212,7 @@ func (s *State) Info() Info {
 	for i, m := range s.setup.Roster {
 		roster[i] = m.Peer
 	}
-	return Info{ID: s.setup.ID, Players: s.setup.Players, Expires: s.setup.Expires, Phase: s.phase, Version: len(s.events), Roster: roster}
+	return Info{ID: s.setup.ID, Players: s.setup.Players, Expires: s.setup.Expires, Phase: s.phase, Version: s.version, Roster: roster}
 }
 
 func (s *State) Setup() Setup { return cloneSetup(s.setup) }
@@ -203,29 +220,30 @@ func (s *State) Setup() Setup { return cloneSetup(s.setup) }
 // View returns a copy of the game's state.
 func (s *State) View() []byte { return bytes.Clone(s.state) }
 
-// Events returns copies of the events after the given version.
-func (s *State) Events(after int) []Event {
-	if after < 0 || after > len(s.events) {
-		return nil
-	}
-	out := slices.Clone(s.events[after:])
-	for i := range out {
-		out[i].Body = bytes.Clone(out[i].Body)
-	}
-	return out
+type applied struct {
+	ID  string
+	Seq int
 }
 
 type snapshot struct {
-	Setup  Setup
-	Phase  Phase
-	State  []byte
-	Events []Event
+	Setup    Setup
+	Phase    Phase
+	Version  int
+	State    []byte
+	Receipts map[string][]applied `json:",omitempty"` // per player, oldest first
 }
 
-// Snapshot serializes the whole state, so a member that fell far behind can be
-// brought up to date without replaying every entry.
+// Snapshot serializes the whole state. Its size does not grow with the number
+// of moves, so the agreed entries behind it can be thrown away and a member
+// that fell far behind can be brought up to date from it.
 func (s *State) Snapshot() ([]byte, error) {
-	return json.Marshal(snapshot{s.setup, s.phase, s.state, s.events})
+	p := snapshot{Setup: s.setup, Phase: s.phase, Version: s.version, State: s.state, Receipts: make(map[string][]applied, len(s.recent))}
+	for peer, ids := range s.recent {
+		for _, id := range ids {
+			p.Receipts[peer] = append(p.Receipts[peer], applied{id, s.receipts[receipt{peer, id}]})
+		}
+	}
+	return json.Marshal(p)
 }
 
 // Restore rebuilds a state from a Snapshot.
@@ -237,19 +255,19 @@ func Restore(data []byte, g game.Game) (*State, error) {
 	if err := checkSetup(p.Setup, g); err != nil {
 		return nil, err
 	}
-	if p.Phase != Playing && p.Phase != Finished && p.Phase != Expired {
-		return nil, errors.New("invalid snapshot phase")
+	if p.Phase != Playing && p.Phase != Finished && p.Phase != Expired || p.Version < 1 {
+		return nil, errors.New("invalid snapshot")
 	}
-	if len(p.Events) == 0 || len(p.Events) > MaxEvents+1 || p.Events[0].Kind != KindStart {
-		return nil, errors.New("invalid snapshot events")
-	}
-	s := &State{setup: p.Setup, game: g, phase: p.Phase, state: p.State, events: p.Events, receipts: make(map[receipt]int)}
-	for i, e := range p.Events {
-		if e.Seq != i+1 {
-			return nil, errors.New("invalid snapshot events")
+	s := &State{setup: p.Setup, game: g, phase: p.Phase, version: p.Version, state: p.State, receipts: make(map[receipt]int), recent: make(map[string][]string)}
+	for peer, list := range p.Receipts {
+		if !s.member(peer) || len(list) > Receipts || p.Phase != Playing {
+			return nil, errors.New("invalid snapshot receipts")
 		}
-		if e.Kind == KindGame {
-			s.receipts[receipt{e.Peer, e.CommandID}] = e.Seq
+		for _, a := range list {
+			if _, dup := s.receipts[receipt{peer, a.ID}]; dup || a.ID == "" || len(a.ID) > maxID || a.Seq < 2 || a.Seq > p.Version {
+				return nil, errors.New("invalid snapshot receipts")
+			}
+			s.remember(peer, a.ID, a.Seq)
 		}
 	}
 	return s, nil

@@ -16,7 +16,7 @@ const (
 	MaxPlayers = 32
 	MaxTTL     = 72 * time.Hour
 	MaxPayload = 4096
-	MaxEvents  = 4096 // per room, including the start event
+	Receipts   = 1024 // a player's most recent commands whose retries are recognised
 	maxID      = 128
 )
 
@@ -38,9 +38,8 @@ const (
 	Expired  Phase = "expired"
 )
 
-// Event and entry kinds.
+// Entry kinds.
 const (
-	KindStart  = "start"
 	KindGame   = "game"
 	KindFinish = "finish"
 	KindExpire = "expire"
@@ -62,15 +61,6 @@ type Setup struct {
 	Players          int
 	Created, Expires time.Time
 	Roster           []Member
-}
-
-// Event is one committed step of a game. Seq 1 is always the start.
-type Event struct {
-	Seq       int
-	Kind      string
-	Peer      string
-	CommandID string `json:",omitempty"`
-	Body      []byte `json:",omitempty"`
 }
 
 // Token returns a random room ID or invite secret.

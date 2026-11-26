@@ -303,18 +303,41 @@ func TestApplyRejectsInvalidEntriesIdentically(t *testing.T) {
 	}
 }
 
-func TestEventLimit(t *testing.T) {
+// A game may take any number of moves: what a copy holds does not grow with them.
+func TestNoLimitOnMovesAndTheCopyStaysSmall(t *testing.T) {
 	s := started(t, "host", "bob")
-	for i := 2; i <= room.MaxEvents; i++ {
-		if r := submit(t, s, "bob", strconv.Itoa(i)); r.Seq != i {
+	const moves = 20000
+	for i := 1; i <= moves; i++ {
+		if r := submit(t, s, "bob", strconv.Itoa(i)); r.Seq != i+1 {
 			t.Fatal(i, r)
 		}
 	}
-	if _, _, err := s.Decide("bob", "one-too-many", []byte("inc")); err == nil {
-		t.Fatal("exceeded the event limit")
+	if string(s.View()) != strconv.Itoa(moves) || s.Info().Version != moves+1 {
+		t.Fatal(string(s.View()), s.Info().Version)
 	}
-	if r := s.Apply(s.End(room.KindFinish, "host")); r.Seq != room.MaxEvents+1 {
-		t.Fatal("a full game could not be finished:", r)
+	snap, err := s.Snapshot()
+	if err != nil || len(snap) > 64<<10 {
+		t.Fatal("the copy grew with the number of moves:", len(snap), err)
+	}
+	// A retry is recognised among the player's most recent commands...
+	recent := strconv.Itoa(moves - room.Receipts + 1)
+	if r := submit(t, s, "bob", recent); !r.Repeat || r.Seq != moves-room.Receipts+2 {
+		t.Fatal("recent receipt lost:", r)
+	}
+	if _, ok := s.Receipt("bob", strconv.Itoa(moves-room.Receipts)); ok {
+		t.Fatal("window larger than room.Receipts")
+	}
+	// ...and each player has its own window: the host's first move is still known.
+	first := submit(t, s, "host", "host-1")
+	for i := 0; i < room.Receipts; i++ {
+		submit(t, s, "bob", "more-"+strconv.Itoa(i))
+	}
+	if r := submit(t, s, "host", "host-1"); !r.Repeat || r.Seq != first.Seq {
+		t.Fatal("one player's moves pushed out another's receipt:", r)
+	}
+	// An older one is forgotten: its ID then counts as a new command.
+	if _, ok := s.Receipt("bob", "1"); ok {
+		t.Fatal("receipts are kept without bound")
 	}
 }
 
@@ -334,9 +357,12 @@ func TestFinishAndExpireEndTheGame(t *testing.T) {
 		if r := s.Apply(room.Entry{Kind: room.KindGame, Peer: "bob", CommandID: "bob-2", Body: []byte("+1"), Based: 3}); r.Err == "" {
 			t.Fatal("entry applied after the end")
 		}
-		// A retry of an earlier command still gets its receipt.
-		if _, done, err := s.Decide("bob", "bob-1", []byte("inc")); err != nil || done == nil || done.Seq != 2 {
-			t.Fatal(done, err)
+		// Once the game is over only its result is kept, not its moves.
+		if _, ok := s.Receipt("bob", "bob-1"); ok {
+			t.Fatal("move detail kept after the end")
+		}
+		if string(s.View()) != "1" {
+			t.Fatal("result lost:", string(s.View()))
 		}
 	}
 }
@@ -361,11 +387,8 @@ func TestGameCanEndItself(t *testing.T) {
 		}
 		s.Apply(e)
 	}
-	if s.Info().Phase != room.Finished || s.Info().Version != 4 {
-		t.Fatal(s.Info())
-	}
-	if ev := s.Events(3); len(ev) != 1 || ev[0].Kind != room.KindFinish {
-		t.Fatal(ev)
+	if s.Info().Phase != room.Finished || s.Info().Version != 4 || string(s.View()) != "2" {
+		t.Fatal(s.Info(), string(s.View()))
 	}
 }
 
@@ -394,7 +417,11 @@ func TestSnapshotRestoresAnIdenticalCopy(t *testing.T) {
 	if string(a) != string(b) {
 		t.Fatal("copies diverged")
 	}
-	for _, bad := range []string{"", "{}", `{"Setup":{"ID":"../x"}}`, strings.Replace(string(snap), `"Seq":2`, `"Seq":7`, 1)} {
+	for _, bad := range []string{"", "{}", `{"Setup":{"ID":"../x"}}`,
+		strings.Replace(string(snap), `"Seq":2`, `"Seq":7`, 1),         // a receipt beyond the version
+		strings.Replace(string(snap), `"Version":3`, `"Version":0`, 1), // no start
+		strings.Replace(string(snap), `"ID":"bob-1"`, `"ID":""`, 1),    // a nameless command
+		strings.Replace(string(snap), `"Phase":"playing"`, `"Phase":"x"`, 1)} {
 		if _, err := room.Restore([]byte(bad), counter.Game{}); err == nil {
 			t.Fatal("restored a bad snapshot:", bad)
 		}
@@ -435,7 +462,7 @@ func TestRecordIsWrittenWholeAndOnlyOnRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	r, err := room.ReadRecord(file)
-	if err != nil || r.Status != "interrupted" || r.Version != 2 || string(r.State) != "1" || len(r.Events) != 2 || len(r.Players) != 2 {
+	if err != nil || r.Status != "interrupted" || r.Version != 2 || string(r.Result) != "1" || len(r.Players) != 2 {
 		t.Fatal(r, err)
 	}
 	s.Apply(s.End(room.KindFinish, "host"))
@@ -443,8 +470,15 @@ func TestRecordIsWrittenWholeAndOnlyOnRequest(t *testing.T) {
 	if err != nil || again != file || filepath.Dir(file) != filepath.Join(dir, "games") {
 		t.Fatal(again, err)
 	}
-	if r, _ = room.ReadRecord(file); r.Status != "finished" || r.Version != 3 {
+	if r, _ = room.ReadRecord(file); r.Status != "finished" || r.Version != 3 || string(r.Result) != "1" {
 		t.Fatal(r)
+	}
+	// The record is the result only: no move, command ID or mover appears in it.
+	raw, _ := os.ReadFile(file)
+	for _, detail := range []string{"bob-1", "Events", "CommandID", "+1"} {
+		if strings.Contains(string(raw), detail) {
+			t.Fatalf("record holds move detail %q: %s", detail, raw)
+		}
 	}
 	if entries, _ := os.ReadDir(filepath.Join(dir, "games")); len(entries) != 1 {
 		t.Fatal("leftover files:", entries)
@@ -454,5 +488,26 @@ func TestRecordIsWrittenWholeAndOnlyOnRequest(t *testing.T) {
 	}
 	if _, err := room.WriteRecord(dir, room.Record{ID: "../escape"}); err == nil {
 		t.Fatal("wrote outside the games folder")
+	}
+}
+
+// scored keeps only a summary of its final state.
+type scored struct{ counter.Game }
+
+func (scored) Result(state []byte) []byte { return []byte("score=" + string(state)) }
+
+func TestGameChoosesWhatTheRecordKeeps(t *testing.T) {
+	l := lobby(t, room.Config{Players: 2})
+	join(t, l, "bob")
+	setup, _ := l.Start(member("host"))
+	s, err := room.NewState(setup, scored{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, _, _ := s.Decide("bob", "a", []byte("inc"))
+	s.Apply(e)
+	s.Apply(s.End(room.KindFinish, "host"))
+	if r := s.Record(); string(r.Result) != "score=1" || r.Status != "finished" {
+		t.Fatal(string(r.Result), r.Status)
 	}
 }

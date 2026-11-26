@@ -75,6 +75,7 @@ type Player struct {
 	roster  map[peer.ID]bool
 	expires time.Time
 	raft    *raft.Raft
+	logs    *store
 	layer   *layer
 	obs     *raft.Observer
 	obsCh   chan raft.Observation
@@ -224,8 +225,10 @@ func (p *Player) Changes() <-chan struct{} { return p.changes }
 
 // Submit makes a move and returns its sequence number. It retries with the same
 // ID until a host commits it or ctx ends (after 10 s if ctx has no deadline);
-// the ID makes a retry count once. It returns once this player's own copy holds
-// the move, or at most a second after the host committed it.
+// the ID makes a retry count once, unless room.Receipts of this player's later
+// moves commit in between (only possible with many Submits running at once).
+// It returns once this player's own copy holds the move, or at most a second
+// after the host committed it.
 func (p *Player) Submit(ctx context.Context, id string, cmd []byte) (int, error) {
 	seq, err := p.retry(ctx, func() (reply, error) { return p.try(ctx, id, cmd) })
 	if err == nil {
@@ -310,7 +313,7 @@ func (p *Player) try(ctx context.Context, id string, cmd []byte) (reply, error) 
 	seq, done := 0, false
 	if st != nil {
 		phase = st.Info().Phase
-		seq, done = st.Receipt(me, id) // a retry of a move that counted, even after the end
+		seq, done = st.Receipt(me, id) // a retry of a recent move that counted; none once the game is over
 	}
 	p.mu.Unlock()
 	switch {

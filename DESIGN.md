@@ -10,6 +10,7 @@ What is implemented now (see README.md for how to use it):
 - **Two players.** Only the creator votes: if the guest drops, the host plays on and the guest catches up; if the host drops, the game pauses; if the host's program closes, the game ends as `interrupted` for both.
 - **One replication address per run.** Each run of the program uses `<peerID>/<roomID>/<nonce>` as its Raft address, so a restarted program with an empty memory cannot be mistaken for its old self.
 - **Rejoining after a restart.** A restarted program joins again with the same identity and a new replication address. Any member tells it where the host is; only the host sends it the Setup (a different one from a later answer fails the rejoin) and where the other members are now. The host removes the old run's Raft server, adds the new one as a nonvoter and, once it holds the host's version, makes it a voter again if its seat votes. This needs a host.
+- **Compaction.** Old entries are replaced by a small snapshot of the game (its state, version and recent receipts), so a game can run for any number of moves; a far-behind or rejoining player is brought up to date from the snapshot. When the game ends, every player drops its log: only the snapshot of the result remains in memory.
 - **A record at the end.** Each player writes `games/<roomID>.json` once, when the game finishes or expires or when it leaves mid-game. Nothing is written per move.
 - **One game per build.** A second selectable game needs a game name in `room.Config` and `Setup`, checked on join.
 
@@ -17,7 +18,8 @@ These statements in the proposal below no longer hold:
 
 - A move is durable because a majority of players hold it in memory; nothing is written per move.
 - Hosts change: if the host drops out, the others elect one (not with two players). No game resumes from disk: a player whose program restarted gets its seat back from the other players' memory, through the host.
-- Records are kept until the user deletes them. The proposal purged everything at expiry; whether records should be purged too is an open question.
+- Nothing is purged at expiry. Results are kept until the user deletes them; move detail is never written and is dropped from memory when the game ends.
+- Retries are recognised only among each player's last 1,024 moves (`room.Receipts`) and only while the game is played; after the end only the result is kept.
 
 ## Original design proposal
 

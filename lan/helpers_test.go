@@ -5,9 +5,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kaobei-alabo/you-be-the-ball/game"
 	"github.com/kaobei-alabo/you-be-the-ball/game/counter"
 	"github.com/kaobei-alabo/you-be-the-ball/room"
 )
+
+// theGame is what the helpers play; a test may swap it.
+var theGame game.Game = counter.Game{}
 
 var fast = Timing{Heartbeat: 100 * time.Millisecond, Lease: 50 * time.Millisecond, Commit: 2 * time.Millisecond}
 
@@ -23,7 +27,7 @@ func newNode(t *testing.T, dir string) *Node {
 
 func hostRoom(t *testing.T, c room.Config, o Options) *Player {
 	t.Helper()
-	p, err := Host(newNode(t, t.TempDir()), counter.Game{}, c, o)
+	p, err := Host(newNode(t, t.TempDir()), theGame, c, o)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +39,7 @@ func join(t *testing.T, n *Node, inv Invite, o Options) (*Player, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	p, err := Join(ctx, n, counter.Game{}, inv, o)
+	p, err := Join(ctx, n, theGame, inv, o)
 	if err == nil {
 		t.Cleanup(func() { p.Close() })
 	}
@@ -55,7 +59,7 @@ func play(t *testing.T, c room.Config, tm Timing) []*Player {
 
 func playOn(t *testing.T, nodes []*Node, c room.Config, tm Timing) []*Player {
 	t.Helper()
-	h, err := Host(nodes[0], counter.Game{}, c, Options{Dir: t.TempDir(), Timing: tm})
+	h, err := Host(nodes[0], theGame, c, Options{Dir: t.TempDir(), Timing: tm})
 	if err != nil {
 		t.Fatal(err)
 	}
